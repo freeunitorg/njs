@@ -1,0 +1,82 @@
+name: Build and Release njs
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - '*'              # Срабатывает на любые теги (включая 0.9.6)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev zlib1g-dev libpcre2-dev libxslt1-dev libgeoip-dev \
+            libgd-dev libxml2-dev libedit-dev libperl-dev libtest-harness-perl \
+            libgd-perl libgeoip-dev expect meson ninja-build
+
+      - name: Configure and make njs
+        run: |
+          ./configure
+          make -j$(nproc)
+
+      - name: Run tests
+        run: |
+          make test
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: njs-libs
+          path: |
+            build/libnjs.so
+            build/nginx/*.so
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/') && !startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get tag name
+        id: tag
+        run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: njs-libs
+          path: build
+
+      - name: Create source archive
+        run: |
+          git archive --format=tar.gz --output=njs-${{ steps.tag.outputs.TAG }}.tar.gz --prefix=njs-${{ steps.tag.outputs.TAG }}/ HEAD
+          git archive --format=zip --output=njs-${{ steps.tag.outputs.TAG }}.zip --prefix=njs-${{ steps.tag.outputs.TAG }}/ HEAD
+
+      - name: Create libraries archive
+        run: |
+          tar -czvf njs-${{ steps.tag.outputs.TAG }}-libs.tar.gz build/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.tag.outputs.TAG }}
+          tag_name: ${{ steps.tag.outputs.TAG }}
+          files: |
+            njs-${{ steps.tag.outputs.TAG }}.tar.gz
+            njs-${{ steps.tag.outputs.TAG }}.zip
+            njs-${{ steps.tag.outputs.TAG }}-libs.tar.gz
+          generate_release_notes: true
