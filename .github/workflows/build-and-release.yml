@@ -34,7 +34,20 @@ jobs:
       - name: Run tests
         run: |
           make test
-
+          
+      - name: List build artifacts (debug)
+        run: |
+          echo "=== Current directory ==="
+          pwd
+          echo "=== build directory contents ==="
+          ls -la build/ || echo "build/ does not exist"
+          echo "=== nginx directory contents (if exists) ==="
+          ls -la build/nginx/ || echo "build/nginx/ does not exist"
+          echo "=== Find all .so files ==="
+          find . -name "*.so" -type f
+          echo "=== Find all .a files ==="
+          find . -name "*.a" -type f
+    
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
