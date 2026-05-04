@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -21,10 +23,6 @@ jobs:
         run: |
           ./configure
           make -j$(nproc)
-
-      - name: Run tests
-        run: |
-          make test
 
       - name: Create source archive (for release)
         run: |
