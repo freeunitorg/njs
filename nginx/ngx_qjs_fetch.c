@@ -131,22 +131,19 @@ static const JSCFunctionListEntry  ngx_qjs_ext_fetch_headers_proto[] = {
 
 
 static const JSCFunctionListEntry  ngx_qjs_ext_fetch_request_proto[] = {
-#define NGX_QJS_BODY_ARRAY_BUFFER   0
-#define NGX_QJS_BODY_JSON           1
-#define NGX_QJS_BODY_TEXT           2
     JS_CFUNC_MAGIC_DEF("arrayBuffer", 0, ngx_qjs_ext_fetch_request_body,
-                       NGX_QJS_BODY_ARRAY_BUFFER),
+                       NGX_JS_BODY_ARRAY_BUFFER),
     JS_CGETSET_DEF("bodyUsed", ngx_qjs_ext_fetch_request_body_used, NULL),
     JS_CGETSET_DEF("cache", ngx_qjs_ext_fetch_request_cache, NULL),
     JS_CGETSET_DEF("credentials", ngx_qjs_ext_fetch_request_credentials, NULL),
     JS_CFUNC_MAGIC_DEF("json", 0, ngx_qjs_ext_fetch_request_body,
-                       NGX_QJS_BODY_JSON),
+                       NGX_JS_BODY_JSON),
     JS_CGETSET_DEF("headers", ngx_qjs_ext_fetch_request_headers, NULL ),
     JS_CGETSET_MAGIC_DEF("method", ngx_qjs_ext_fetch_request_field, NULL,
                          offsetof(ngx_js_request_t, method) ),
     JS_CGETSET_DEF("mode", ngx_qjs_ext_fetch_request_mode, NULL),
     JS_CFUNC_MAGIC_DEF("text", 0, ngx_qjs_ext_fetch_request_body,
-                       NGX_QJS_BODY_TEXT),
+                       NGX_JS_BODY_TEXT),
     JS_CGETSET_MAGIC_DEF("url", ngx_qjs_ext_fetch_request_field, NULL,
                          offsetof(ngx_js_request_t, url) ),
 };
@@ -154,17 +151,17 @@ static const JSCFunctionListEntry  ngx_qjs_ext_fetch_request_proto[] = {
 
 static const JSCFunctionListEntry  ngx_qjs_ext_fetch_response_proto[] = {
     JS_CFUNC_MAGIC_DEF("arrayBuffer", 0, ngx_qjs_ext_fetch_response_body,
-                       NGX_QJS_BODY_ARRAY_BUFFER),
+                       NGX_JS_BODY_ARRAY_BUFFER),
     JS_CGETSET_DEF("bodyUsed", ngx_qjs_ext_fetch_response_body_used, NULL),
     JS_CGETSET_DEF("headers", ngx_qjs_ext_fetch_response_headers, NULL ),
     JS_CFUNC_MAGIC_DEF("json", 0, ngx_qjs_ext_fetch_response_body,
-                       NGX_QJS_BODY_JSON),
+                       NGX_JS_BODY_JSON),
     JS_CGETSET_DEF("ok", ngx_qjs_ext_fetch_response_ok, NULL),
     JS_CGETSET_DEF("redirected", ngx_qjs_ext_fetch_response_redirected, NULL),
     JS_CGETSET_DEF("status", ngx_qjs_ext_fetch_response_status, NULL),
     JS_CGETSET_DEF("statusText", ngx_qjs_ext_fetch_response_status_text, NULL),
     JS_CFUNC_MAGIC_DEF("text", 0, ngx_qjs_ext_fetch_response_body,
-                       NGX_QJS_BODY_TEXT),
+                       NGX_JS_BODY_TEXT),
     JS_CGETSET_DEF("type", ngx_qjs_ext_fetch_response_type, NULL),
     JS_CGETSET_MAGIC_DEF("url", ngx_qjs_ext_fetch_response_field, NULL,
                          offsetof(ngx_js_response_t, url) ),
@@ -762,7 +759,7 @@ ngx_qjs_fetch_response_ctor(JSContext *cx, JSValueConst new_target, int argc,
     ret = ngx_list_init(&response->headers.header_list, pool, 4,
                         sizeof(ngx_js_tb_elt_t));
     if (ret != NGX_OK) {
-        JS_ThrowOutOfMemory(cx);
+        return JS_ThrowOutOfMemory(cx);
     }
 
     init = argv[1];
@@ -828,7 +825,7 @@ ngx_qjs_fetch_response_ctor(JSContext *cx, JSValueConst new_target, int argc,
             rc = ngx_qjs_headers_fill(cx, &response->headers, value);
             JS_FreeValue(cx, value);
 
-            if (ret != NGX_OK) {
+            if (rc != NGX_OK) {
                 return JS_EXCEPTION;
             }
         }
@@ -1461,6 +1458,9 @@ ngx_qjs_headers_ext_keys(JSContext *cx, JSValue value)
 
             hdr.data = (u_char *) JS_ToCStringLen(cx, &hdr.len, key);
             JS_FreeValue(cx, key);
+            if (hdr.data == NULL) {
+                goto fail;
+            }
 
             found = h[i].key.len == hdr.len
                     && ngx_strncasecmp(h[i].key.data,
@@ -1476,7 +1476,7 @@ ngx_qjs_headers_ext_keys(JSContext *cx, JSValue value)
         if (k == n) {
             item = JS_NewStringLen(cx, (const char *) h[i].key.data,
                                     h[i].key.len);
-            if (JS_IsException(value)) {
+            if (JS_IsException(item)) {
                 goto fail;
             }
 
@@ -2027,7 +2027,7 @@ ngx_qjs_ext_fetch_request_body(JSContext *cx, JSValueConst this_val,
     request->body_used = 1;
 
     switch (magic) {
-    case NGX_QJS_BODY_ARRAY_BUFFER:
+    case NGX_JS_BODY_ARRAY_BUFFER:
         /*
          * no free_func for JS_NewArrayBuffer()
          * because request->body is allocated from e->pool
@@ -2041,15 +2041,15 @@ ngx_qjs_ext_fetch_request_body(JSContext *cx, JSValueConst this_val,
 
         break;
 
-    case NGX_QJS_BODY_JSON:
-    case NGX_QJS_BODY_TEXT:
+    case NGX_JS_BODY_JSON:
+    case NGX_JS_BODY_TEXT:
     default:
         result = qjs_string_create(cx, request->body.data, request->body.len);
         if (JS_IsException(result)) {
             return JS_ThrowOutOfMemory(cx);
         }
 
-        if (magic == NGX_QJS_BODY_JSON) {
+        if (magic == NGX_JS_BODY_JSON) {
             string = js_malloc(cx, request->body.len + 1);
 
             JS_FreeValue(cx, result);
@@ -2309,14 +2309,14 @@ ngx_qjs_ext_fetch_response_body(JSContext *cx, JSValueConst this_val,
     response->body_used = 1;
 
     switch (magic) {
-    case NGX_QJS_BODY_ARRAY_BUFFER:
-    case NGX_QJS_BODY_TEXT:
+    case NGX_JS_BODY_ARRAY_BUFFER:
+    case NGX_JS_BODY_TEXT:
         ret = njs_chb_join(&response->chain, &string);
         if (ret != NJS_OK) {
             return JS_ThrowOutOfMemory(cx);
         }
 
-        if (magic == NGX_QJS_BODY_TEXT) {
+        if (magic == NGX_JS_BODY_TEXT) {
             result = qjs_string_create(cx, string.start, string.length);
             if (JS_IsException(result)) {
                 return JS_ThrowOutOfMemory(cx);
@@ -2338,7 +2338,7 @@ ngx_qjs_ext_fetch_response_body(JSContext *cx, JSValueConst this_val,
 
         break;
 
-    case NGX_QJS_BODY_JSON:
+    case NGX_JS_BODY_JSON:
     default:
         /* 'string.start' must be zero terminated. */
         njs_chb_append_literal(&response->chain, "\0");

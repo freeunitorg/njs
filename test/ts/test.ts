@@ -66,8 +66,38 @@ async function http_module(r: NginxHTTPRequest) {
     r.requestText == 'a';
     r.requestText?.startsWith('a');
 
+    // jsVarNames()
+    let var_names: string[] = r.jsVarNames();
+    let prefixed: string[] = r.jsVarNames('cookie_');
+
+    // decline()
+    r.decline();
+
     // r.requestBuffer
     r.requestBuffer?.equals(Buffer.from([1]));
+
+    // r.readRequestText
+    let text: string = await r.readRequestText();
+
+    // r.readRequestArrayBuffer
+    let buf: ArrayBuffer = await r.readRequestArrayBuffer();
+
+    // r.readRequestJSON
+    let json: any = await r.readRequestJSON();
+
+    // r.readRequestForm
+    let form: NginxHTTPRequestForm = await r.readRequestForm();
+    let form_limited: NginxHTTPRequestForm = await r.readRequestForm({maxKeys: 100});
+    let v1: NginxHTTPRequestFormValue | null = form.get('field1');
+    let v2: NginxHTTPRequestFormValue[] = form.getAll('field2');
+    let h: boolean = form.has('field3');
+    form.forEach((val, key, f) => { /* void */ }, null);
+    let has_files: boolean = form.hasFiles();
+    if (v1 != null) {
+        if (v1.type === 'file') {
+            let fn: string = v1.name;  // type discriminant narrows to file
+        }
+    }
 
     // r.responseText
     r.responseText == 'a';
