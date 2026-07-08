@@ -62,6 +62,10 @@ http {
             js_content test.content_length_keys;
         }
 
+        location /content_length_error {
+            js_content test.content_length_error;
+        }
+
         location /content_type {
             charset windows-1251;
 
@@ -215,6 +219,16 @@ $t->write_file('test.js', <<EOF);
         r.headersOut['Content-Length'] = 3;
         var in_keys = Object.keys(r.headersOut).some(v=>v=='Content-Length');
         r.return(200, `B:\${in_keys}`);
+    }
+
+    function content_length_error(r) {
+        try {
+            r.headersOut['Content-Length'] = 'x';
+            r.return(200, 'no_error');
+
+        } catch (e) {
+            r.return(500, `\${e.constructor.name}:\${e.message}`);
+        }
     }
 
     function content_type(r) {
@@ -470,7 +484,8 @@ $t->write_file('test.js', <<EOF);
     }
 
     export default {njs:test_njs, content_length, content_length_arr,
-                    content_length_keys, content_type, content_type_arr,
+                    content_length_keys, content_length_error,
+                    content_type, content_type_arr,
                     content_encoding, content_encoding_arr, headers_list,
                     hdr_in, raw_hdr_in, hdr_sorted_keys, foo_in, ifoo_in,
                     hdr_out, raw_hdr_out, hdr_out_array, hdr_out_single,
@@ -481,7 +496,7 @@ $t->write_file('test.js', <<EOF);
 
 EOF
 
-$t->try_run('no njs')->plan(50);
+$t->try_run('no njs')->plan(53);
 
 ###############################################################################
 
@@ -506,6 +521,9 @@ unlike(http_get('/hdr_out?foo'), qr/Foo:/, 'r.headersOut no value 2');
 like(http_get('/content_length_keys'), qr/B:true/, 'Content-Length in keys');
 like(http_get('/content_length_arr'), qr/Content-Length: 3/,
 	'set Content-Length arr');
+like(http_get('/content_length_error'),
+	qr/500.*TypeError:failed converting argument to positive integer/s,
+	'set invalid Content-Length');
 
 like(http_get('/content_type'), qr/B:true/, 'Content-Type in keys');
 like(http_get('/content_type_arr'), qr/Content-Type: text\/html/,
@@ -581,6 +599,19 @@ like(http(
 	. 'Foo: bar2' . CRLF
 	. 'Host: localhost' . CRLF . CRLF
 ), qr/foo: bar1,\s?bar2/, 'r.headersIn duplicate generic');
+
+like(http(
+	'GET /hdr_in HTTP/1.0' . CRLF
+	. 'Proxy-Connection: keep-alive' . CRLF
+	. 'Host: localhost' . CRLF . CRLF
+), qr/proxy-connection: keep-alive/, 'r.headersIn no slot header');
+
+like(http(
+	'GET /hdr_in HTTP/1.0' . CRLF
+	. 'Proxy-Connection: foo1' . CRLF
+	. 'Proxy-Connection: foo2' . CRLF
+	. 'Host: localhost' . CRLF . CRLF
+), qr/proxy-connection: foo1,\s?foo2/, 'r.headersIn no slot header duplicate');
 
 like(http_get('/in_lowkey'), qr/X{16}/, 'r.headersIn name is not overwritten');
 

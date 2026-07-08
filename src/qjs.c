@@ -308,7 +308,6 @@ qjs_add_intrinsic_njs(JSContext *cx, JSValueConst global)
     }
 
     if (JS_SetPropertyStr(cx, global, "njs", obj) < 0) {
-        JS_FreeValue(cx, obj);
         return -1;
     }
 
@@ -452,16 +451,22 @@ qjs_process_env(JSContext *ctx, JSValueConst this_val)
         ret = JS_DefinePropertyValue(ctx, obj, atom, str, JS_PROP_C_W_E);
         JS_FreeAtom(ctx, atom);
         if (ret < 0) {
-error:
-            JS_FreeValue(ctx, name);
-            JS_FreeValue(ctx, str);
-            return JS_EXCEPTION;
+            str = JS_UNDEFINED;
+            goto error;
         }
 
         JS_FreeValue(ctx, name);
     }
 
     return obj;
+
+error:
+
+    JS_FreeValue(ctx, name);
+    JS_FreeValue(ctx, str);
+    JS_FreeValue(ctx, obj);
+
+    return JS_EXCEPTION;
 }
 
 
@@ -469,11 +474,11 @@ static JSValue
 qjs_process_kill(JSContext *ctx, JSValueConst this_val, int argc,
     JSValueConst *argv)
 {
-    int                  signo, pid;
-    JSValue              val;
-    njs_str_t            name;
-    const char           *signal;
-    qjs_signal_entry_t   *entry;
+    int                 signo, pid;
+    JSValue             ret;
+    njs_str_t           name;
+    const char          *signal;
+    qjs_signal_entry_t  *entry;
 
     if (JS_ToInt32(ctx, &pid, argv[0]) < 0) {
         return JS_EXCEPTION;
@@ -491,20 +496,15 @@ qjs_process_kill(JSContext *ctx, JSValueConst this_val, int argc,
         }
 
     } else {
-        val = JS_ToString(ctx, argv[1]);
-        if (JS_IsException(val)) {
-            return JS_EXCEPTION;
-        }
-
-        signal = JS_ToCString(ctx, val);
+        signal = JS_ToCString(ctx, argv[1]);
         if (signal == NULL) {
-            JS_FreeValue(ctx, val);
             return JS_EXCEPTION;
         }
 
         if (njs_strlen(signal) < 3 || memcmp(signal, "SIG", 3) != 0) {
+            ret = JS_ThrowTypeError(ctx, "unknown signal: %s", signal);
             JS_FreeCString(ctx, signal);
-            return JS_ThrowTypeError(ctx, "unknown signal: %s", signal);
+            return ret;
         }
 
         name.start = (u_char *) signal + 3;
@@ -517,11 +517,13 @@ qjs_process_kill(JSContext *ctx, JSValueConst this_val, int argc,
             }
         }
 
-        JS_FreeCString(ctx, signal);
-
         if (entry->name.length == 0) {
-            return JS_ThrowTypeError(ctx, "unknown signal: %s", signal);
+            ret = JS_ThrowTypeError(ctx, "unknown signal: %s", signal);
+            JS_FreeCString(ctx, signal);
+            return ret;
         }
+
+        JS_FreeCString(ctx, signal);
     }
 
     if (kill(pid, signo) < 0) {
@@ -566,7 +568,6 @@ qjs_process_object(JSContext *ctx, int argc, const char **argv)
         }
 
         if (JS_DefinePropertyValueUint32(ctx, val, i, str, JS_PROP_C_W_E) < 0) {
-            JS_FreeValue(ctx, str);
             JS_FreeValue(ctx, val);
             return JS_EXCEPTION;
         }
@@ -582,7 +583,7 @@ qjs_process_object(JSContext *ctx, int argc, const char **argv)
                                njs_nitems(qjs_process_proto));
 
     if (JS_SetPropertyStr(ctx, obj, "argv", val) < 0) {
-        JS_FreeValue(ctx, val);
+        JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
     }
 
@@ -745,7 +746,7 @@ qjs_text_decoder_decode(JSContext *cx, JSValueConst this_val, int argc,
 
     td = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_TEXT_DECODER);
     if (td == NULL) {
-        return JS_ThrowInternalError(cx, "'this' is not a TextDecoder");
+        return JS_ThrowTypeError(cx, "'this' is not a TextDecoder");
     }
 
     ret = qjs_typed_array_data(cx, argv[0], &data);
@@ -805,7 +806,7 @@ qjs_text_decoder_encoding(JSContext *ctx, JSValueConst this_val)
 
     td = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_TEXT_DECODER);
     if (td == NULL) {
-        return JS_ThrowInternalError(ctx, "'this' is not a TextDecoder");
+        return JS_ThrowTypeError(ctx, "'this' is not a TextDecoder");
     }
 
     switch (td->encoding) {
@@ -824,7 +825,7 @@ qjs_text_decoder_fatal(JSContext *ctx, JSValueConst this_val)
 
     td = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_TEXT_DECODER);
     if (td == NULL) {
-        return JS_ThrowInternalError(ctx, "'this' is not a TextDecoder");
+        return JS_ThrowTypeError(ctx, "'this' is not a TextDecoder");
     }
 
     return JS_NewBool(ctx, td->fatal);
@@ -838,7 +839,7 @@ qjs_text_decoder_ignore_bom(JSContext *ctx, JSValueConst this_val)
 
     td = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_TEXT_DECODER);
     if (td == NULL) {
-        return JS_ThrowInternalError(ctx, "'this' is not a TextDecoder");
+        return JS_ThrowTypeError(ctx, "'this' is not a TextDecoder");
     }
 
     return JS_NewBool(ctx, td->ignore_bom);
@@ -918,7 +919,7 @@ qjs_text_encoder_encode(JSContext *cx, JSValueConst this_val, int argc,
 
     te = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_TEXT_ENCODER);
     if (te == NULL) {
-        return JS_ThrowInternalError(cx, "'this' is not a TextEncoder");
+        return JS_ThrowTypeError(cx, "'this' is not a TextEncoder");
     }
 
     if (!JS_IsString(argv[0])) {
@@ -989,7 +990,7 @@ qjs_text_encoder_encode_into(JSContext *cx, JSValueConst this_val, int argc,
 
     te = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_TEXT_ENCODER);
     if (te == NULL) {
-        return JS_ThrowInternalError(cx, "'this' is not a TextEncoder");
+        return JS_ThrowTypeError(cx, "'this' is not a TextEncoder");
     }
 
     if (!JS_IsString(argv[0])) {
@@ -1191,11 +1192,21 @@ qjs_string_create_chb(JSContext *cx, njs_chb_t *chain)
     njs_str_t  str;
 
     ret = njs_chb_join(chain, &str);
-    njs_chb_destroy(chain);
 
     if (ret != NJS_OK) {
-        return JS_ThrowInternalError(cx, "failed to create string");
+        if (chain->error == NJS_CHB_ERR_OVERFLOW) {
+            val = JS_ThrowRangeError(cx, "invalid string length");
+
+        } else {
+            val = JS_ThrowInternalError(cx, "failed to create string");
+        }
+
+        njs_chb_destroy(chain);
+
+        return val;
     }
+
+    njs_chb_destroy(chain);
 
     val = JS_NewStringLen(cx, (const char *) str.start, str.length);
 

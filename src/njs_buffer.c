@@ -191,7 +191,7 @@ njs_buffer_set(njs_vm_t *vm, njs_value_t *value, const u_char *start,
 
 
 static njs_typed_array_t *
-njs_buffer_alloc(njs_vm_t *vm, size_t size, njs_bool_t zeroing)
+njs_buffer_alloc(njs_vm_t *vm, uint64_t size, njs_bool_t zeroing)
 {
     njs_value_t        value;
     njs_typed_array_t  *array;
@@ -918,7 +918,20 @@ njs_buffer_concat(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
                 return ret;
             }
 
+            /* The getter above may have changed the element type. */
+
+            if (njs_slow_path(!njs_is_typed_array(&val))) {
+                njs_type_error(vm, "\"list[%L]\" argument must be an "
+                                   "instance of Buffer or Uint8Array", i);
+                return NJS_ERROR;
+            }
+
             arr = njs_typed_array(&val);
+            if (njs_slow_path(njs_is_detached_buffer(arr->buffer))) {
+                njs_type_error(vm, "detached buffer");
+                return NJS_ERROR;
+            }
+
             n = njs_min((size_t) len, arr->byte_length);
             src = &njs_typed_array_buffer(arr)->u.u8[arr->offset];
 
@@ -1010,8 +1023,8 @@ njs_buffer_prototype_read_int(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
         }
 
         size = (size_t) njs_number(value);
-        if (njs_slow_path(size > 6)) {
-            njs_type_error(vm, "\"byteLength\" must be <= 6");
+        if (njs_slow_path(size == 0 || size > 6)) {
+            njs_type_error(vm, "\"byteLength\" must be >= 1 and <= 6");
             return NJS_ERROR;
         }
     }
@@ -1225,7 +1238,7 @@ njs_buffer_prototype_read_float(njs_vm_t *vm, njs_value_t *args,
 
     switch (size) {
     case 4:
-        u32 = *((uint32_t *) u8);
+        u32 = njs_get_u32(u8);
 
         if (swap) {
             u32 = njs_bswap_u32(u32);
@@ -1237,7 +1250,7 @@ njs_buffer_prototype_read_float(njs_vm_t *vm, njs_value_t *args,
 
     case 8:
     default:
-        conv_f64.u = *((uint64_t *) u8);
+        conv_f64.u = njs_get_u64(u8);
 
         if (swap) {
             conv_f64.u = njs_bswap_u64(conv_f64.u);
@@ -1296,8 +1309,8 @@ njs_buffer_prototype_write_int(njs_vm_t *vm, njs_value_t *args,
         }
 
         size = (size_t) njs_number(value);
-        if (njs_slow_path(size > 6)) {
-            njs_type_error(vm, "\"byteLength\" must be <= 6");
+        if (njs_slow_path(size == 0 || size > 6)) {
+            njs_type_error(vm, "\"byteLength\" must be >= 1 and <= 6");
             return NJS_ERROR;
         }
     }
@@ -1569,7 +1582,7 @@ njs_buffer_prototype_write_float(njs_vm_t *vm, njs_value_t *args,
             conv_f32.u = njs_bswap_u32(conv_f32.u);
         }
 
-        *((uint32_t *) u8) = conv_f32.u;
+        njs_set_u32(u8, conv_f32.u);
         break;
 
     case 8:
@@ -1580,7 +1593,7 @@ njs_buffer_prototype_write_float(njs_vm_t *vm, njs_value_t *args,
             conv_f64.u = njs_bswap_u64(conv_f64.u);
         }
 
-        *((uint64_t *) u8) = conv_f64.u;
+        njs_set_u64(u8, conv_f64.u);
     }
 
     njs_set_number(retval, index + size);
@@ -1906,6 +1919,11 @@ njs_buffer_fill_typed_array(njs_vm_t *vm, const njs_value_t *value,
     byte_length = arr_from->byte_length;
     from = &njs_typed_array_buffer(arr_from)->u.u8[arr_from->offset];
 
+    if (byte_length == 0) {
+        memset(to, 0, end - to);
+        return NJS_OK;
+    }
+
     if (njs_typed_array_buffer(arr_from)->u.u8 == buffer->u.u8) {
         while (to < end) {
             n = njs_min(byte_length, (size_t) (end - to));
@@ -1975,13 +1993,13 @@ njs_buffer_prototype_to_string(njs_vm_t *vm, njs_value_t *args,
         return NJS_ERROR;
     }
 
-    str.start = &njs_typed_array_buffer(array)->u.u8[array->offset + start];
-    str.length = end - start;
-
-    if (njs_slow_path(str.length == 0)) {
+    if (njs_slow_path(start >= end)) {
         njs_set_empty_string(vm, retval);
         return NJS_OK;
     }
+
+    str.start = &njs_typed_array_buffer(array)->u.u8[array->offset + start];
+    str.length = end - start;
 
     return encoding->encode(vm, retval, &str);
 }
@@ -2007,7 +2025,7 @@ njs_buffer_prototype_copy(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
     njs_int_t           ret;
     njs_value_t         *val1, *val2;
     njs_typed_array_t   *source, *target;
-    njs_array_buffer_t  *buffer, *array;
+    njs_array_buffer_t  *buffer;
 
     val1 = njs_argument(args, 0);
     val2 = njs_arg(args, nargs, 1);
@@ -2041,11 +2059,9 @@ njs_buffer_prototype_copy(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
         return NJS_ERROR;
     }
 
-    array = njs_typed_array_buffer(source);
-
     size = njs_min(trg_end - trg, src_end - src);
 
-    if (buffer->u.data != array->u.data) {
+    if (!njs_memory_overlaps(trg, size, src, size)) {
         memcpy(trg, src, size);
 
     } else {

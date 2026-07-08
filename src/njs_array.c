@@ -788,6 +788,7 @@ static njs_int_t
 njs_array_prototype_slice_copy(njs_vm_t *vm, njs_value_t *this,
     int64_t start, int64_t length, njs_value_t *retval)
 {
+    double             idx;
     size_t             size;
     uint32_t           n;
     njs_int_t          ret;
@@ -871,39 +872,24 @@ njs_array_prototype_slice_copy(njs_vm_t *vm, njs_value_t *this,
 
     njs_set_array(&self, array);
 
-    if (njs_fast_object(length)) {
-        do {
-            ret = njs_value_property_i64(vm, this, start++, &val);
-            if (njs_slow_path(ret == NJS_ERROR)) {
-                return NJS_ERROR;
-            }
-
-            if (ret == NJS_OK) {
-                ret = njs_value_property_i64_set(vm, &self, start, &val);
-                if (njs_slow_path(ret == NJS_ERROR)) {
-                    return ret;
-                }
-            }
-
-            length--;
-        } while (length != 0);
-
-        ret = NJS_OK;
-        goto done;
-    }
-
     keys = njs_array_indices(vm, this);
     if (njs_slow_path(keys == NULL)) {
         return NJS_ERROR;
     }
 
     for (n = 0; n < keys->length; n++) {
+        idx = njs_string_to_index(&keys->start[n]);
+
+        if (idx < start || idx >= start + length) {
+            continue;
+        }
+
         ret = njs_value_property(vm, this, keys->start[n].atom_id, &val);
         if (njs_slow_path(ret == NJS_ERROR)) {
             goto done;
         }
 
-        ret = njs_value_property_set(vm, &self, keys->start[n].atom_id, &val);
+        ret = njs_value_property_i64_set(vm, &self, idx - start, &val);
         if (njs_slow_path(ret == NJS_ERROR)) {
             goto done;
         }
@@ -1695,7 +1681,7 @@ njs_array_prototype_join(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
 
     value = &entry;
 
-    NJS_CHB_MP_INIT(&chain, njs_vm_memory_pool(vm));
+    NJS_CHB_MP_INIT_MAX(&chain, njs_vm_memory_pool(vm), NJS_STRING_MAX_LENGTH);
 
     for (i = 0; i < len; i++) {
         ret = njs_value_property_i64(vm, this, i, value);
@@ -1732,7 +1718,13 @@ njs_array_prototype_join(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
 
     size = njs_chb_size(&chain);
     if (njs_slow_path(size < 0)) {
-        njs_memory_error(vm);
+        if (chain.error == NJS_CHB_ERR_OVERFLOW) {
+            njs_range_error(vm, "invalid string length");
+
+        } else {
+            njs_memory_error(vm);
+        }
+
         return NJS_ERROR;
     }
 
@@ -2749,8 +2741,8 @@ njs_sort_indexed_properties(njs_vm_t *vm, njs_value_t *obj, int64_t length,
 {
     int64_t                i, ilength, nlen;
     njs_int_t              ret;
-    njs_array_t            *array, *keys;
-    njs_value_t            *start, *strings, key;
+    njs_array_t            *keys;
+    njs_value_t            *strings;
     njs_array_sort_ctx_t   ctx;
     njs_array_sort_slot_t  *p, *end, *slots, *newslots;
 
@@ -2765,9 +2757,6 @@ njs_sort_indexed_properties(njs_vm_t *vm, njs_value_t *obj, int64_t length,
     ctx.exception = 0;
 
     if (njs_fast_path(njs_is_fast_array(obj))) {
-        array = njs_array(obj);
-        start = array->start;
-
         slots = njs_mp_alloc(vm->mem_pool,
                              sizeof(njs_array_sort_slot_t) * length);
         if (njs_slow_path(slots == NULL)) {
@@ -2779,24 +2768,13 @@ njs_sort_indexed_properties(njs_vm_t *vm, njs_value_t *obj, int64_t length,
         p = slots;
 
         for (i = 0; i < length; i++) {
-            if (njs_fast_path(njs_is_valid(&start[i]))) {
-                /* not an empty value at index i. */
-                njs_value_assign(&p->value, &start[i]);
+            ret = njs_value_property_i64(vm, obj, i, &p->value);
+            if (njs_slow_path(ret == NJS_ERROR)) {
+                goto exception;
+            }
 
-            } else {
-                ret = njs_uint32_to_string(vm, &key, i);
-                if (njs_slow_path(ret != NJS_OK)) {
-                    goto exception;
-                }
-
-                ret = njs_value_property_val(vm, obj, &key, &p->value);
-                if (njs_slow_path(ret == NJS_ERROR)) {
-                    goto exception;
-                }
-
-                if (ret == NJS_DECLINED && skip_holes) {
-                    continue;
-                }
+            if (ret == NJS_DECLINED && skip_holes) {
+                continue;
             }
 
             if (njs_slow_path(njs_is_undefined(&p->value))) {
