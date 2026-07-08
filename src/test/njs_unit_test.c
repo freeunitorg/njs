@@ -5315,6 +5315,13 @@ static njs_unit_test_t  njs_test[] =
     { njs_str("Array.prototype.slice.call({ length: Object.create(null) })"),
       njs_str("TypeError: Cannot convert object to primitive value") },
 
+    /* Large sparse slice goes through the non-fast keys path. */
+
+    { njs_str("var a = []; a[10] = 'a'; a[40000] = 'b'; a.length = 50000;"
+              "var s = a.slice(5, 45000);"
+              "[s.length, s[5], s[39995], (10 in s), (40000 in s)].join(',')"),
+      njs_str("44995,a,b,false,false") },
+
     { njs_str("Array.prototype.slice.call({length:-1})"),
       njs_str("") },
 
@@ -7319,6 +7326,28 @@ static njs_unit_test_t  njs_test[] =
               "           return [a.toReversed(), a].toString() === '1,2,3,3,2,1'})"),
       njs_str("true") },
 
+    /* Same-type copies must honor the source view offset. */
+
+    { njs_str(NJS_TYPED_ARRAY_LIST
+              ".every(v=>{var a = (new v([0,1,2,3,4])).subarray(2);"
+              "           return (new v(a)).toString() === '2,3,4'})"),
+      njs_str("true") },
+
+    { njs_str(NJS_TYPED_ARRAY_LIST
+              ".every(v=>{var a = (new v([0,1,2,3,4])).subarray(2);"
+              "           return a.slice(1, 3).toString() === '3,4'})"),
+      njs_str("true") },
+
+    { njs_str(NJS_TYPED_ARRAY_LIST
+              ".every(v=>{var a = (new v([0,1,2,3,4])).subarray(2);"
+              "           return a.toReversed().toString() === '4,3,2'})"),
+      njs_str("true") },
+
+    { njs_str(NJS_TYPED_ARRAY_LIST
+              ".every(v=>{var a = (new v([0,3,2,1,4])).subarray(2);"
+              "           return a.toSorted().toString() === '1,2,4'})"),
+      njs_str("true") },
+
     { njs_str("Uint8Array.prototype.sort.call(1)"),
       njs_str("TypeError: this is not a typed array") },
 
@@ -7970,6 +7999,16 @@ static njs_unit_test_t  njs_test[] =
               "njs.dump([undefined, 3, /*hole*/, 2, undefined, /*hole*/, 1].sort())"),
       njs_str("[1,2,3,4,undefined,undefined,<empty>]") },
 
+    /* A prototype getter for a hole reallocates the array being sorted. */
+
+    { njs_str("Object.defineProperty(Array.prototype, 1, {configurable: true,"
+              "  get() { for (var i = 0; i < 1024; i++) { this.push(i); }"
+              "          return 5; }});"
+              "var a = [3]; a[2] = 7; a.length = 3;"
+              "a.sort(function(x, y) { return x - y; });"
+              "a[0] === 3 && a[1] === 5 && a[2] === 7"),
+      njs_str("true") },
+
     { njs_str("var a = [3,2,1]; [a.toSorted(), a]"),
       njs_str("1,2,3,3,2,1") },
 
@@ -8159,6 +8198,12 @@ static njs_unit_test_t  njs_test[] =
 
     { njs_str("`\\${a}bc"),
       njs_str("SyntaxError: Unterminated template literal") },
+
+    { njs_str("`\\ud83d`"),
+      njs_str("�") },
+
+    { njs_str("`\\ud83d${1}`"),
+      njs_str("�1") },
 
     { njs_str("var v = undefined; var u8 = 'α';"
               "[`undefined${u8}`.length, `undefineQ${u8}`.length]"),
@@ -8714,6 +8759,18 @@ static njs_unit_test_t  njs_test[] =
                  "var a = Array(200).fill(s);"
                  "String.prototype.concat.apply(s, a.slice(1))"),
       njs_str("RangeError: invalid string length") },
+
+#if (NJS_64BIT)
+    /*
+     * Adversarial regex replace must throw RangeError instead of
+     * OOM-killing the process.  The chain accumulates ~2GiB before the
+     * cap trips, hence 64-bit only.
+     */
+    { njs_str("var s = 'x'.repeat(1 << 18);"
+                 "var r = '$1'.repeat(1 << 14);"
+                 "s.replace(/(.+)/g, r)"),
+      njs_str("RangeError: invalid string length") },
+#endif
 
     { njs_str("var a = 'abcdefgh'; a.substr(3, 15)"),
       njs_str("defgh") },
@@ -11833,6 +11890,108 @@ static njs_unit_test_t  njs_test[] =
                  "var o = new F(1, 2);"
                  "o.a"),
       njs_str("7") },
+
+    { njs_str("let a = 1;"
+              "function f(x, y) { return x + ':' + y; }"
+              "f(a, a = 2)"),
+      njs_str("1:2") },
+
+    { njs_str("let a = 1, b = 4;"
+              "function f(x, y) { return x + ':' + y; }"
+              "f(a = b, b = 2)"),
+      njs_str("4:2") },
+
+    { njs_str("function f(x, y) { return x + ':' + y; }"
+              "function g(a) { return f(a, a = 2); }"
+              "g(1)"),
+      njs_str("1:2") },
+
+    { njs_str("let a = 1;"
+              "let o = { m: function(x, y) { return x + ':' + y; } };"
+              "o.m(a, a = 2)"),
+      njs_str("1:2") },
+
+    { njs_str("let a = 1;"
+              "let o = { get m() { a = 9;"
+              "    return function(x, y) { return x + ':' + y + ':' + a; };"
+              "} };"
+              "o.m(a, a = 2)"),
+      njs_str("9:2:2") },
+
+    { njs_str("let a = 1;"
+              "let o = { get x() { a = 2; return 3; } };"
+              "function f(x, y) { return x + ':' + y; }"
+              "f(a, o.x)"),
+      njs_str("1:3") },
+
+    { njs_str("let a = 1;"
+              "function f(x, y) { return x + ':' + y; }"
+              "Object.defineProperty(globalThis, 'b', {"
+              "    get: function() { a = 2; return 3; },"
+              "    configurable: true"
+              "});"
+              "let r = f(a, b);"
+              "delete globalThis.b;"
+              "r"),
+      njs_str("1:3") },
+
+    { njs_str("let a = 1;"
+              "function f(x, y, z) { return x + ':' + y + ':' + z; }"
+              "f(a, (a = 2, a), a = 3)"),
+      njs_str("1:2:3") },
+
+    { njs_str("let a = 1;"
+              "function f(x, y, z) { return x + ':' + y + ':' + z; }"
+              "f(a, 0, a = 2)"),
+      njs_str("1:0:2") },
+
+    { njs_str("let a = 1;"
+              "function f(x, y) { return x + ':' + y; }"
+              "f(a, ++a)"),
+      njs_str("1:2") },
+
+    { njs_str("let a = 1;"
+              "function f(x, y) { return x + ':' + y; }"
+              "f(a, true ? (a = 2) : 0)"),
+      njs_str("1:2") },
+
+    { njs_str("let a = 0;"
+              "function f(x, y) { return x + ':' + y; }"
+              "f(a, a ||= 2)"),
+      njs_str("0:2") },
+
+    { njs_str("let a = 1;"
+              "function f(x, y) { return x + ':' + y; }"
+              "function g(v) { return v; }"
+              "f(a, g(a = 2))"),
+      njs_str("1:2") },
+
+    { njs_str("function f(x, y) { return x + ':' + y; }"
+              "function g() { let a = 1;"
+              "    return function() { return f(a, a = 2); };"
+              "}"
+              "g()()"),
+      njs_str("1:2") },
+
+    { njs_str("let a = 1;"
+              "function F(x, y) { this.v = x + ':' + y; }"
+              "new F(a, a = 2).v"),
+      njs_str("1:2") },
+
+    { njs_str("let a = 1;"
+              "function f(x, y, z) { return x + ':' + y + ':' + z; }"
+              "f(a, [a = 2][0], { k: a = 3 }.k)"),
+      njs_str("1:2:3") },
+
+    { njs_str("let o = { x: 1 };"
+              "function f(x, y) { return x + ':' + y; }"
+              "f(o.x, o.x = 2)"),
+      njs_str("1:2") },
+
+    { njs_str("let a = 1;"
+              "let f = function(x, y) { return 'orig:' + x + ':' + y; };"
+              "f(a, (f = function() { return 'new'; }, a = 2))"),
+      njs_str("orig:1:2") },
 
     { njs_str("function F(a, b) { return }"
                  "F.prototype.constructor === F"),
@@ -23583,6 +23742,71 @@ njs_chb_test(njs_vm_t *vm, njs_opts_t *opts, njs_stat_t *stat)
 
     njs_chb_destroy(&chain);
     njs_mp_free(njs_vm_memory_pool(vm), string.start);
+
+    /*
+     * Overflow: capped chain refuses appends beyond max_size and
+     * reports NJS_CHB_ERR_OVERFLOW.
+     */
+    NJS_CHB_MP_INIT_MAX(&chain, njs_vm_memory_pool(vm), 100);
+
+    njs_chb_append_literal(&chain, "0123456789");
+
+    if (chain.error != NJS_CHB_ERR_NONE || njs_chb_size(&chain) != 10) {
+        ret = NJS_ERROR;
+        njs_printf("chb cap: pre-overflow state wrong, "
+                   "error:%d size:%z\n",
+                   (int) chain.error, (size_t) njs_chb_size(&chain));
+        goto done;
+    }
+
+    for (i = 0; i < 20; i++) {
+        njs_chb_append(&chain, "0123456789", 10);
+    }
+
+    if (chain.error != NJS_CHB_ERR_OVERFLOW) {
+        ret = NJS_ERROR;
+        njs_printf("chb cap: expected NJS_CHB_ERR_OVERFLOW, got %d\n",
+                   (int) chain.error);
+        goto done;
+    }
+
+    if (njs_chb_size(&chain) != -1) {
+        ret = NJS_ERROR;
+        njs_printf("chb cap: size after overflow should be -1, got %z\n",
+                   (size_t) njs_chb_size(&chain));
+        goto done;
+    }
+
+    njs_chb_destroy(&chain);
+
+    /*
+     * Full-chain drop preserves max_size.
+     */
+    NJS_CHB_MP_INIT_MAX(&chain, njs_vm_memory_pool(vm), 20);
+
+    njs_chb_append_literal(&chain, "0123456789");
+    njs_chb_drop(&chain, 100);
+
+    if (chain.max_size != 20 || njs_chb_size(&chain) != 0) {
+        ret = NJS_ERROR;
+        njs_printf("chb drop: full reset lost cap or size, "
+                   "max_size:%z size:%z\n",
+                   (size_t) chain.max_size, (size_t) njs_chb_size(&chain));
+        goto done;
+    }
+
+    /* Chain still enforces the cap after the reset. */
+    for (i = 0; i < 5; i++) {
+        njs_chb_append_literal(&chain, "0123456789");
+    }
+
+    if (chain.error != NJS_CHB_ERR_OVERFLOW) {
+        ret = NJS_ERROR;
+        njs_printf("chb drop: cap not enforced after full reset\n");
+        goto done;
+    }
+
+    njs_chb_destroy(&chain);
 
 done:
 

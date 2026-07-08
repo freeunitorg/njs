@@ -2714,10 +2714,12 @@ ngx_js_dict_load(ngx_js_dict_t *dict)
 
     len = size;
 
-    buf = ngx_pnalloc(pool, len);
+    buf = ngx_pnalloc(pool, len + 1);
     if (buf == NULL) {
         goto failed;
     }
+
+    buf[len] = '\0';
 
     n = ngx_read_fd(fd, buf, len);
 
@@ -3600,7 +3602,6 @@ ngx_qjs_ext_shared_dict_items(JSContext *cx, JSValueConst this_val,
 
         if (JS_DefinePropertyValueUint32(cx, kv, 0, v, JS_PROP_C_W_E) < 0) {
             ngx_rwlock_unlock(&dict->sh->rwlock);
-            JS_FreeValue(cx, v);
             JS_FreeValue(cx, kv);
             JS_FreeValue(cx, arr);
             return JS_EXCEPTION;
@@ -3610,7 +3611,6 @@ ngx_qjs_ext_shared_dict_items(JSContext *cx, JSValueConst this_val,
 
         if (JS_DefinePropertyValueUint32(cx, kv, 1, v, JS_PROP_C_W_E) < 0) {
             ngx_rwlock_unlock(&dict->sh->rwlock);
-            JS_FreeValue(cx, v);
             JS_FreeValue(cx, kv);
             JS_FreeValue(cx, arr);
             return JS_EXCEPTION;
@@ -3618,7 +3618,6 @@ ngx_qjs_ext_shared_dict_items(JSContext *cx, JSValueConst this_val,
 
         if (JS_DefinePropertyValueUint32(cx, arr, i++, kv, JS_PROP_C_W_E) < 0) {
             ngx_rwlock_unlock(&dict->sh->rwlock);
-            JS_FreeValue(cx, kv);
             JS_FreeValue(cx, arr);
             return JS_EXCEPTION;
         }
@@ -3709,7 +3708,6 @@ ngx_qjs_ext_shared_dict_keys(JSContext *cx, JSValueConst this_val, int argc,
                                          JS_PROP_C_W_E) < 0)
         {
             ngx_rwlock_unlock(&dict->sh->rwlock);
-            JS_FreeValue(cx, key);
             JS_FreeValue(cx, arr);
             return JS_EXCEPTION;
         }
@@ -4433,7 +4431,6 @@ ngx_qjs_ngx_shared_dict_init(JSContext *cx, const char *name)
     if (JS_SetPropertyStr(cx, global_obj, "SharedMemoryError", shared_ctor)
         < 0)
     {
-        JS_FreeValue(cx, shared_ctor);
         JS_FreeValue(cx, global_obj);
         return NULL;
     }
