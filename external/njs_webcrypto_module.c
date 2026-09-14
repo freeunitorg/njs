@@ -847,10 +847,20 @@ njs_cipher_pkey(njs_vm_t *vm, njs_str_t *data, njs_webcrypto_key_t *key,
     u_char                  *dst;
     size_t                  outlen;
     njs_int_t               ret;
+#if (NJS_OPENSSL_HAS_RSA_OAEP_MD)
     const EVP_MD            *md;
+#endif
     EVP_PKEY_CTX            *ctx;
     EVP_PKEY_cipher_t       cipher;
     EVP_PKEY_cipher_init_t  init;
+
+#if (!NJS_OPENSSL_HAS_RSA_OAEP_MD)
+    if (key->hash != NJS_HASH_SHA1) {
+        njs_vm_type_error(vm, "RSA-OAEP with \"%V\" digest is not supported",
+                          njs_algorithm_hash_name(key->hash));
+        return NJS_ERROR;
+    }
+#endif
 
     ctx = EVP_PKEY_CTX_new(key->u.a.pkey, NULL);
     if (njs_slow_path(ctx == NULL)) {
@@ -875,11 +885,30 @@ njs_cipher_pkey(njs_vm_t *vm, njs_str_t *data, njs_webcrypto_key_t *key,
         goto fail;
     }
 
+    ret = EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING);
+    if (njs_slow_path(ret <= 0)) {
+        njs_webcrypto_error(vm, "EVP_PKEY_CTX_set_rsa_padding() failed");
+        ret = NJS_ERROR;
+        goto fail;
+    }
+
+#if (NJS_OPENSSL_HAS_RSA_OAEP_MD)
     md = njs_algorithm_hash_digest(key->hash);
 
-    EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING);
-    EVP_PKEY_CTX_set_signature_md(ctx, md);
-    EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, md);
+    ret = EVP_PKEY_CTX_set_rsa_oaep_md(ctx, md);
+    if (njs_slow_path(ret <= 0)) {
+        njs_webcrypto_error(vm, "EVP_PKEY_CTX_set_rsa_oaep_md() failed");
+        ret = NJS_ERROR;
+        goto fail;
+    }
+
+    ret = EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, md);
+    if (njs_slow_path(ret <= 0)) {
+        njs_webcrypto_error(vm, "EVP_PKEY_CTX_set_rsa_mgf1_md() failed");
+        ret = NJS_ERROR;
+        goto fail;
+    }
+#endif
 
     ret = cipher(ctx, NULL, &outlen, data->start, data->length);
     if (njs_slow_path(ret <= 0)) {
@@ -2166,6 +2195,11 @@ njs_export_base64url_bignum(njs_vm_t *vm, njs_opaque_value_t *retval,
         size = BN_num_bytes(v);
     }
 
+    if (njs_slow_path(size > sizeof(buf))) {
+        njs_vm_range_error(vm, "JWK key too long: %uz > 512", size);
+        return NJS_ERROR;
+    }
+
     if (njs_bn_bn2binpad(v, &buf[0], size) <= 0) {
         return NJS_ERROR;
     }
@@ -3177,6 +3211,7 @@ njs_import_base64url_bignum(njs_vm_t *vm, njs_opaque_value_t *value)
     (void) njs_decode_base64url_length(&data, &decoded.length);
 
     if (njs_slow_path(decoded.length > sizeof(buf))) {
+        njs_vm_range_error(vm, "JWK key too long: %uz > 512", decoded.length);
         return NULL;
     }
 

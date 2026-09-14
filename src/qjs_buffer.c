@@ -2313,6 +2313,155 @@ qjs_base64url_decode_length(JSContext *ctx, const njs_str_t *src)
 }
 
 
+JSValue
+qjs_string_btoa(JSContext *cx, const njs_str_t *src)
+{
+    u_char                *bytes, *b;
+    uint32_t              cp;
+    JSValue               ret;
+    njs_str_t             bin;
+    const u_char          *p, *end;
+    njs_unicode_decode_t  ctx;
+
+    if (src->length == 0) {
+        return JS_NewStringLen(cx, "", 0);
+    }
+
+    bytes = js_malloc(cx, src->length);
+    if (bytes == NULL) {
+        return JS_ThrowOutOfMemory(cx);
+    }
+
+    p = src->start;
+    end = src->start + src->length;
+    b = bytes;
+
+    njs_utf8_decode_init(&ctx);
+
+    while (p < end) {
+        cp = njs_utf8_decode(&ctx, &p, end);
+
+        if (cp > 0xff) {
+            js_free(cx, bytes);
+            return JS_ThrowTypeError(cx, "invalid character (> U+00FF)");
+        }
+
+        *b++ = (u_char) cp;
+    }
+
+    bin.start = bytes;
+    bin.length = b - bytes;
+
+    ret = qjs_string_base64(cx, &bin);
+
+    js_free(cx, bytes);
+
+    return ret;
+}
+
+
+njs_inline void
+qjs_chb_write_byte_as_utf8(njs_chb_t *chain, u_char byte)
+{
+    njs_utf8_encode(njs_chb_current(chain), byte);
+    njs_chb_written(chain, njs_utf8_size(byte));
+}
+
+
+JSValue
+qjs_string_atob(JSContext *cx, const njs_str_t *src)
+{
+    u_char        c, v;
+    uint32_t      acc, bits;
+    size_t        i, total, pad;
+    njs_chb_t     chain;
+    const u_char  *b64;
+
+    /* Forgiving-base64 decode. */
+
+    b64 = qjs_basis64;
+
+    /*
+     * Each significant character contributes six bits; even when every
+     * decoded byte expands to two UTF-8 bytes, the output is bounded by the
+     * input length, so the chain needs no byte cap.
+     */
+    NJS_CHB_CTX_INIT(&chain, cx);
+
+    if (njs_chb_reserve(&chain, src->length * 2) == NULL) {
+        njs_chb_destroy(&chain);
+        return JS_ThrowOutOfMemory(cx);
+    }
+
+    acc = 0;
+    bits = 0;
+    total = 0;
+    pad = 0;
+
+    for (i = 0; i < src->length; i++) {
+        c = src->start[i];
+
+        switch (c) {
+        case ' ':
+        case '\t':
+        case '\n':
+        case '\f':
+        case '\r':
+            continue;
+
+        case '=':
+            pad++;
+            continue;
+        }
+
+        if (pad > 0) {
+            /* A significant character following the padding. */
+            goto error;
+        }
+
+        v = b64[c];
+        if (v == 77) {
+            goto error;
+        }
+
+        acc = (acc << 6) | v;
+        bits += 6;
+        total++;
+
+        if (bits >= 8) {
+            bits -= 8;
+            qjs_chb_write_byte_as_utf8(&chain, (acc >> bits) & 0xff);
+        }
+    }
+
+    /*
+     * Padding may only complete the final quad: a remainder of one
+     * character is malformed and padding is allowed only when the cleaned
+     * input length is a multiple of four.
+     */
+    if (pad > 2
+        || (total + pad) % 4 == 1
+        || (pad > 0 && (total + pad) % 4 != 0))
+    {
+        goto error;
+    }
+
+    if (total == 0) {
+        njs_chb_destroy(&chain);
+        return JS_NewStringLen(cx, "", 0);
+    }
+
+    return qjs_string_create_chb(cx, &chain);
+
+error:
+
+    njs_chb_destroy(&chain);
+
+    return JS_ThrowTypeError(cx,
+                       "the string to be decoded is not correctly encoded");
+}
+
+
 njs_inline njs_int_t
 qjs_char_to_hex(u_char c)
 {
@@ -2517,8 +2666,11 @@ qjs_buffer_builtin_init(JSContext *ctx)
     JSValue    global_obj, buffer, proto, ctor, ta, ta_proto, symbol, species;
     JSClassID  u8_ta_class_id;
 
-    JS_NewClass(JS_GetRuntime(ctx), QJS_CORE_CLASS_ID_BUFFER,
-                &qjs_buffer_class);
+    if (JS_NewClass(JS_GetRuntime(ctx), QJS_CORE_CLASS_ID_BUFFER,
+                    &qjs_buffer_class) < 0)
+    {
+        return -1;
+    }
 
     global_obj = JS_GetGlobalObject(ctx);
 
@@ -2534,8 +2686,12 @@ qjs_buffer_builtin_init(JSContext *ctx)
      * We use JS_SetClassProto()/JS_GetClassProto() as a key-value store
      * for fast value query by class ID without querying the global object.
      */
-    JS_NewClass(JS_GetRuntime(ctx), QJS_CORE_CLASS_ID_UINT8_ARRAY_CTOR,
-                &qjs_uint8_array_ctor_class);
+    if (JS_NewClass(JS_GetRuntime(ctx), QJS_CORE_CLASS_ID_UINT8_ARRAY_CTOR,
+                    &qjs_uint8_array_ctor_class) < 0)
+    {
+        return -1;
+    }
+
     JS_SetClassProto(ctx, QJS_CORE_CLASS_ID_UINT8_ARRAY_CTOR,
                      JS_DupValue(ctx, ctor));
 #endif
