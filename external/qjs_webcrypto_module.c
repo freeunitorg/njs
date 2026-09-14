@@ -624,10 +624,20 @@ qjs_cipher_pkey(JSContext *cx, njs_str_t *data, qjs_webcrypto_key_t *key,
     u_char                  *dst;
     size_t                  outlen;
     JSValue                 ret;
+#if (NJS_OPENSSL_HAS_RSA_OAEP_MD)
     const EVP_MD            *md;
+#endif
     EVP_PKEY_CTX            *ctx;
     EVP_PKEY_cipher_t       cipher;
     EVP_PKEY_cipher_init_t  init;
+
+#if (!NJS_OPENSSL_HAS_RSA_OAEP_MD)
+    if (key->hash != QJS_HASH_SHA1) {
+        JS_ThrowTypeError(cx, "RSA-OAEP with \"%s\" digest is not supported",
+                          qjs_algorithm_hash_name(key->hash));
+        return JS_EXCEPTION;
+    }
+#endif
 
     ctx = EVP_PKEY_CTX_new(key->u.a.pkey, NULL);
     if (ctx == NULL) {
@@ -652,11 +662,30 @@ qjs_cipher_pkey(JSContext *cx, njs_str_t *data, qjs_webcrypto_key_t *key,
         goto fail;
     }
 
+    rc = EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING);
+    if (rc <= 0) {
+        qjs_webcrypto_error(cx, "EVP_PKEY_CTX_set_rsa_padding() failed");
+        ret = JS_EXCEPTION;
+        goto fail;
+    }
+
+#if (NJS_OPENSSL_HAS_RSA_OAEP_MD)
     md = qjs_algorithm_hash_digest(key->hash);
 
-    EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING);
-    EVP_PKEY_CTX_set_signature_md(ctx, md);
-    EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, md);
+    rc = EVP_PKEY_CTX_set_rsa_oaep_md(ctx, md);
+    if (rc <= 0) {
+        qjs_webcrypto_error(cx, "EVP_PKEY_CTX_set_rsa_oaep_md() failed");
+        ret = JS_EXCEPTION;
+        goto fail;
+    }
+
+    rc = EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, md);
+    if (rc <= 0) {
+        qjs_webcrypto_error(cx, "EVP_PKEY_CTX_set_rsa_mgf1_md() failed");
+        ret = JS_EXCEPTION;
+        goto fail;
+    }
+#endif
 
     rc = cipher(ctx, NULL, &outlen, data->start, data->length);
     if (rc <= 0) {
@@ -1403,6 +1432,11 @@ qjs_export_base64url_bignum(JSContext *cx, const BIGNUM *v, size_t size)
 
     if (size == 0) {
         size = BN_num_bytes(v);
+    }
+
+    if (size > sizeof(buf)) {
+        JS_ThrowRangeError(cx, "JWK key too long: %zu > 512", size);
+        return JS_EXCEPTION;
     }
 
     if (njs_bn_bn2binpad(v, &buf[0], size) <= 0) {
@@ -2367,7 +2401,6 @@ free:
 #else
         (void) pctx;
         (void) olen;
-        (void) &string_info;
         (void) &info;
 #endif
 
@@ -3076,6 +3109,7 @@ qjs_import_base64url_bignum(JSContext *cx, JSValue value)
 
     if (decoded.length > sizeof(buf)) {
         JS_ThrowRangeError(cx, "JWK key too long: %zu > 512", decoded.length);
+        JS_FreeCString(cx, (char *) data.start);
         return NULL;
     }
 
@@ -4449,11 +4483,11 @@ qjs_convert_der_to_p1363(JSContext *cx, EVP_PKEY *pkey, const u_char *der,
     s = ec_sig->s;
 #endif
 
-    if (BN_bn2binpad(r, data, n) <= 0) {
+    if (njs_bn_bn2binpad(r, data, n) <= 0) {
         goto fail;
     }
 
-    if (BN_bn2binpad(s, &data[n], n) <= 0) {
+    if (njs_bn_bn2binpad(s, &data[n], n) <= 0) {
         goto fail;
     }
 
@@ -4513,7 +4547,7 @@ qjs_convert_p1363_to_der(JSContext *cx, EVP_PKEY *pkey, u_char *p1363,
         goto fail;
     }
 
-    if (ECDSA_SIG_set0(ec_sig, r, s) != 1) {
+    if (njs_ecdsa_sig_set0(ec_sig, r, s) != 1) {
         BN_free(r);
         BN_free(s);
         JS_ThrowOutOfMemory(cx);

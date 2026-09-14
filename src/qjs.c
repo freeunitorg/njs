@@ -48,6 +48,12 @@ typedef struct {
 extern char  **environ;
 
 
+static int qjs_add_intrinsic_btoa_atob(JSContext *cx, JSValueConst global);
+static JSValue qjs_global_btoa(JSContext *ctx, JSValueConst this_val, int argc,
+    JSValueConst *argv);
+static JSValue qjs_global_atob(JSContext *ctx, JSValueConst this_val, int argc,
+    JSValueConst *argv);
+
 static int qjs_add_intrinsic_njs(JSContext *cx, JSValueConst global);
 static JSValue qjs_njs_on(JSContext *ctx, JSValueConst this_val, int argc,
     JSValueConst *argv);
@@ -159,6 +165,69 @@ static JSClassDef qjs_text_decoder_class = {
 };
 
 
+static int
+qjs_add_intrinsic_btoa_atob(JSContext *cx, JSValueConst global)
+{
+    JSValue  func;
+
+    func = JS_NewCFunction(cx, qjs_global_btoa, "btoa", 1);
+    if (JS_IsException(func)) {
+        return -1;
+    }
+
+    if (JS_SetPropertyStr(cx, global, "btoa", func) < 0) {
+        return -1;
+    }
+
+    func = JS_NewCFunction(cx, qjs_global_atob, "atob", 1);
+    if (JS_IsException(func)) {
+        return -1;
+    }
+
+    return JS_SetPropertyStr(cx, global, "atob", func);
+}
+
+
+static JSValue
+qjs_global_btoa(JSContext *cx, JSValueConst this_val, int argc,
+    JSValueConst *argv)
+{
+    JSValue    ret;
+    njs_str_t  str;
+
+    str.start = (u_char *) JS_ToCStringLen(cx, &str.length, argv[0]);
+    if (str.start == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    ret = qjs_string_btoa(cx, &str);
+
+    JS_FreeCString(cx, (char *) str.start);
+
+    return ret;
+}
+
+
+static JSValue
+qjs_global_atob(JSContext *cx, JSValueConst this_val, int argc,
+    JSValueConst *argv)
+{
+    JSValue    ret;
+    njs_str_t  str;
+
+    str.start = (u_char *) JS_ToCStringLen(cx, &str.length, argv[0]);
+    if (str.start == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    ret = qjs_string_atob(cx, &str);
+
+    JS_FreeCString(cx, (char *) str.start);
+
+    return ret;
+}
+
+
 JSContext *
 qjs_new_context(JSRuntime *rt, qjs_module_t **addons)
 {
@@ -172,6 +241,8 @@ qjs_new_context(JSRuntime *rt, qjs_module_t **addons)
     if (ctx == NULL) {
         return NULL;
     }
+
+    global_obj = JS_UNDEFINED;
 
     JS_AddIntrinsicBaseObjects(ctx);
     JS_AddIntrinsicDate(ctx);
@@ -188,14 +259,14 @@ qjs_new_context(JSRuntime *rt, qjs_module_t **addons)
 
     for (module = qjs_modules; *module != NULL; module++) {
         if ((*module)->init(ctx, (*module)->name) == NULL) {
-            return NULL;
+            goto failed;
         }
     }
 
     if (addons != NULL) {
         for (module = addons; *module != NULL; module++) {
             if ((*module)->init(ctx, (*module)->name) == NULL) {
-                return NULL;
+                goto failed;
             }
         }
     }
@@ -203,42 +274,53 @@ qjs_new_context(JSRuntime *rt, qjs_module_t **addons)
     global_obj = JS_GetGlobalObject(ctx);
 
     if (qjs_add_intrinsic_njs(ctx, global_obj) < 0) {
-        return NULL;
+        goto failed;
     }
 
     if (qjs_add_intrinsic_text_decoder(ctx, global_obj) < 0) {
-        return NULL;
+        goto failed;
     }
 
     if (qjs_add_intrinsic_text_encoder(ctx, global_obj) < 0) {
-        return NULL;
+        goto failed;
+    }
+
+    if (qjs_add_intrinsic_btoa_atob(ctx, global_obj) < 0) {
+        goto failed;
     }
 
     prop = JS_NewAtom(ctx, "eval");
     if (prop == JS_ATOM_NULL) {
-        return NULL;
+        goto failed;
     }
 
     ret = JS_DeleteProperty(ctx, global_obj, prop, 0);
     JS_FreeAtom(ctx, prop);
     if (ret < 0) {
-        return NULL;
+        goto failed;
     }
 
     prop = JS_NewAtom(ctx, "Function");
     if (prop == JS_ATOM_NULL) {
-        return NULL;
+        goto failed;
     }
 
     ret = JS_DeleteProperty(ctx, global_obj, prop, 0);
     JS_FreeAtom(ctx, prop);
     if (ret < 0) {
-        return NULL;
+        goto failed;
     }
 
     JS_FreeValue(ctx, global_obj);
 
     return ctx;
+
+failed:
+
+    JS_FreeValue(ctx, global_obj);
+    JS_FreeContext(ctx);
+
+    return NULL;
 }
 
 
@@ -1170,17 +1252,61 @@ qjs_typed_array_data(JSContext *ctx, JSValueConst value, njs_str_t *data)
 }
 
 
+#ifdef NJS_HAVE_QUICKJS_ARRAY_BUFFER_MAX_LEN
+
+#define qjs_array_buffer_create(cx, src, len, free, shared)                    \
+    JS_NewArrayBuffer(cx, src, len, 0, free, NULL, shared)
+
+
+/*
+ * ArrayBuffer.prototype.transfer() reallocates the data even when the
+ * buffer is not resizable, so the whole realloc contract has to be
+ * implemented here.
+ */
+
+static void *
+qjs_array_buffer_free(JSRuntime *rt, void *opaque, void *ptr, size_t size)
+{
+    if (size == 0) {
+        js_free_rt(rt, ptr);
+        return NULL;
+    }
+
+    return js_realloc_rt(rt, ptr, size);
+}
+
+#else
+
+#define qjs_array_buffer_create(cx, src, len, free, shared)                    \
+    JS_NewArrayBuffer(cx, src, len, free, NULL, shared)
+
+
 static void
-js_array_buffer_free(JSRuntime *rt, void *opaque, void *ptr)
+qjs_array_buffer_free(JSRuntime *rt, void *opaque, void *ptr)
 {
     js_free_rt(rt, ptr);
 }
+
+#endif
 
 
 JSValue
 qjs_new_array_buffer(JSContext *cx, uint8_t *src, size_t len)
 {
-    return JS_NewArrayBuffer(cx, src, len, js_array_buffer_free, NULL, 0);
+    return qjs_array_buffer_create(cx, src, len, qjs_array_buffer_free, 0);
+}
+
+
+/*
+ * The memory is not managed by the engine, the caller is responsible for
+ * keeping it alive while the buffer is reachable.
+ */
+
+JSValue
+qjs_new_external_array_buffer(JSContext *cx, uint8_t *src, size_t len,
+    int is_shared)
+{
+    return qjs_array_buffer_create(cx, src, len, NULL, is_shared);
 }
 
 
