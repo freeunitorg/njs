@@ -65,6 +65,24 @@ njs_key_is_integer_index(double num, const njs_value_t *value)
 }
 
 
+/*
+ * The range is tested before the conversion: converting a NaN or an out of
+ * range double to an unsigned integer is undefined.
+ */
+
+njs_inline njs_bool_t
+njs_number_is_atom_index(double num, uint32_t *index)
+{
+    if (njs_slow_path(!(num >= 0 && num < 0x80000000))) {
+        return 0;
+    }
+
+    *index = (uint32_t) num;
+
+    return (double) *index == num;
+}
+
+
 njs_inline int64_t
 njs_number_to_integer(double num)
 {
@@ -134,24 +152,6 @@ njs_inline uint16_t
 njs_number_to_uint16(double num)
 {
     return (uint16_t) njs_number_to_int32(num);
-}
-
-
-njs_inline uint64_t
-njs_number_to_length(double num)
-{
-    if (isnan(num)) {
-        return 0;
-    }
-
-    if (num > NJS_MAX_LENGTH) {
-        return NJS_MAX_LENGTH;
-
-    } else if (num < 0.0) {
-        return 0;
-    }
-
-    return (uint64_t) num;
 }
 
 

@@ -12,11 +12,18 @@
 #include <libxml/xpathInternals.h>
 
 
+typedef struct qjs_xml_retired_s  qjs_xml_retired_t;
+
+struct qjs_xml_retired_s {
+    xmlNode            *nodes;
+    qjs_xml_retired_t  *next;
+};
+
+
 typedef struct {
-    xmlDoc         *doc;
-    xmlParserCtxt  *ctx;
-    xmlNode        *free;
-    int            ref_count;
+    xmlDoc             *doc;
+    qjs_xml_retired_t  *retired;
+    int                ref_count;
 } qjs_xml_doc_t;
 
 
@@ -64,6 +71,9 @@ static void qjs_xml_doc_free(JSRuntime *rt, qjs_xml_doc_t *current);
 
 static JSValue qjs_xml_node_make(JSContext *cx, qjs_xml_doc_t *doc,
     xmlNode *node);
+static int qjs_xml_node_has_method(JSContext *cx, JSValueConst obj,
+    JSAtom prop, njs_str_t *name);
+static JSValue qjs_xml_attr_value(JSContext *cx, xmlAttr *attr);
 static int qjs_xml_node_get_own_property(JSContext *cx,
     JSPropertyDescriptor *pdesc, JSValueConst obj, JSAtom prop);
 static int qjs_xml_node_get_own_property_names(JSContext *cx,
@@ -75,8 +85,14 @@ static int qjs_xml_node_delete_property(JSContext *cx, JSValueConst obj,
 static int qjs_xml_node_define_own_property(JSContext *cx, JSValueConst obj,
     JSAtom atom, JSValueConst value, JSValueConst getter, JSValueConst setter,
     int flags);
+static int qjs_xml_node_property_modify(JSContext *cx, JSValueConst obj,
+    JSAtom atom, JSValueConst value, int delete);
 static JSValue qjs_xml_node_add_child(JSContext *cx, JSValueConst this_val,
     int argc, JSValueConst *argv);
+static JSValue qjs_xml_node_get_attribute_ns(JSContext *cx,
+    JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue qjs_xml_node_get_child_ns(JSContext *cx,
+    JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue qjs_xml_node_remove_children(JSContext *cx,
     JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue qjs_xml_node_set_attribute(JSContext *cx, JSValueConst this_val,
@@ -109,12 +125,20 @@ static qjs_xml_nset_t *qjs_xml_nset_create(JSContext *cx, xmlDoc *doc,
 static qjs_xml_nset_t *qjs_xml_nset_add(qjs_xml_nset_t *nset,
     qjs_xml_nset_t *add);
 static void qjs_xml_nset_free(JSContext *cx, qjs_xml_nset_t *nset);
-static int qjs_xml_encode_special_chars(JSContext *cx, njs_str_t *src,
-    njs_str_t *out);
-static void qjs_xml_replace_node(JSContext *cx, qjs_xml_node_t *node,
-    xmlNode *current);
+static qjs_xml_node_t *qjs_xml_ns_args(JSContext *cx, JSValueConst this_val,
+    JSValueConst *argv, njs_str_t *uri, njs_str_t *local);
+static void qjs_xml_ns_args_free(JSContext *cx, njs_str_t *uri,
+    njs_str_t *local);
+static int qjs_xml_ns_match(const xmlChar *name, xmlNs *ns, njs_str_t *uri,
+    njs_str_t *local);
+static int qjs_xml_node_is_live(xmlNode *node);
+static xmlNode *qjs_xml_list_detach(xmlNode *parent, njs_str_t *name);
+static int qjs_xml_list_retire(JSContext *cx, qjs_xml_doc_t *doc,
+    xmlNode *parent, njs_str_t *name);
+static void qjs_xml_list_append(xmlNode *parent, xmlNode *node);
+static int qjs_xml_tree_has_namespaces(xmlNode *node);
 
-static void qjs_xml_error(JSContext *cx, qjs_xml_doc_t *current,
+static void qjs_xml_error(JSContext *cx, xmlParserCtxt *ctx,
     const char *fmt, ...);
 static JSModuleDef *qjs_xml_init(JSContext *ctx, const char *name);
 
@@ -136,6 +160,8 @@ static const JSCFunctionListEntry qjs_xml_doc_proto[] = {
 static const JSCFunctionListEntry qjs_xml_node_proto[] = {
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "XMLNode", JS_PROP_CONFIGURABLE),
     JS_CFUNC_DEF("addChild", 1, qjs_xml_node_add_child),
+    JS_CFUNC_DEF("getAttributeNS", 2, qjs_xml_node_get_attribute_ns),
+    JS_CFUNC_DEF("getChildNS", 2, qjs_xml_node_get_child_ns),
     JS_CFUNC_DEF("removeChildren", 1, qjs_xml_node_remove_children),
     JS_CFUNC_DEF("setAttribute", 2, qjs_xml_node_set_attribute),
     JS_CFUNC_DEF("removeAttribute", 1, qjs_xml_node_remove_attribute),
@@ -195,6 +221,7 @@ qjs_xml_parse(JSContext *cx, JSValueConst this_val, int argc,
 {
     JSValue        ret;
     qjs_bytes_t    data;
+    xmlParserCtxt  *ctx;
     qjs_xml_doc_t  *tree;
 
     if (qjs_to_bytes(cx, &data, argv[0]) < 0) {
@@ -210,23 +237,26 @@ qjs_xml_parse(JSContext *cx, JSValueConst this_val, int argc,
 
     tree->ref_count = 1;
 
-    tree->ctx = xmlNewParserCtxt();
-    if (tree->ctx == NULL) {
+    ctx = xmlNewParserCtxt();
+    if (ctx == NULL) {
         qjs_bytes_free(cx, &data);
         JS_ThrowInternalError(cx, "xmlNewParserCtxt() failed");
         qjs_xml_doc_free(JS_GetRuntime(cx), tree);
         return JS_EXCEPTION;
     }
 
-    tree->doc = xmlCtxtReadMemory(tree->ctx, (char *) data.start, data.length,
-                                  NULL, NULL, XML_PARSE_NOWARNING
-                                              | XML_PARSE_NOERROR);
+    tree->doc = xmlCtxtReadMemory(ctx, (char *) data.start, data.length,
+                                   NULL, NULL, XML_PARSE_NOWARNING
+                                               | XML_PARSE_NOERROR);
     qjs_bytes_free(cx, &data);
     if (tree->doc == NULL) {
-        qjs_xml_error(cx, tree, "failed to parse XML");
+        qjs_xml_error(cx, ctx, "failed to parse XML");
+        xmlFreeParserCtxt(ctx);
         qjs_xml_doc_free(JS_GetRuntime(cx), tree);
         return JS_EXCEPTION;
     }
+
+    xmlFreeParserCtxt(ctx);
 
     ret = JS_NewObjectClass(cx, QJS_CORE_CLASS_ID_XML_DOC);
     if (JS_IsException(ret)) {
@@ -261,6 +291,11 @@ qjs_xml_canonicalization(JSContext *cx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     }
 
+    if (!qjs_xml_node_is_live(node)) {
+        JS_ThrowTypeError(cx, "XMLNode is detached");
+        return JS_EXCEPTION;
+    }
+
     comments = JS_ToBool(cx, argv[2]);
     if (comments < 0) {
         return JS_EXCEPTION;
@@ -276,6 +311,13 @@ qjs_xml_canonicalization(JSContext *cx, JSValueConst this_val, int argc,
         if (nd == NULL) {
             JS_ThrowTypeError(cx, "\"excluding\" argument is not a XMLNode "
                               "object");
+            return JS_EXCEPTION;
+        }
+
+        if (nd->doc->doc != doc
+            || !qjs_xml_node_is_live(nd->node))
+        {
+            JS_ThrowTypeError(cx, "\"excluding\" is not in XMLNode tree");
             return JS_EXCEPTION;
         }
 
@@ -506,26 +548,20 @@ qjs_xml_doc_get_own_property_names(JSContext *cx, JSPropertyEnum **ptab,
 static void
 qjs_xml_doc_free(JSRuntime *rt, qjs_xml_doc_t *current)
 {
-    xmlNode  *node, *next;
+    qjs_xml_retired_t  *retired, *next;
 
     if (--current->ref_count > 0) {
         return;
     }
 
-    node = current->free;
-
-    while (node != NULL) {
-        next = node->next;
-        xmlFreeNode(node);
-        node = next;
+    for (retired = current->retired; retired != NULL; retired = next) {
+        next = retired->next;
+        xmlFreeNodeList(retired->nodes);
+        js_free_rt(rt, retired);
     }
 
     if (current->doc != NULL) {
         xmlFreeDoc(current->doc);
-    }
-
-    if (current->ctx != NULL) {
-        xmlFreeParserCtxt(current->ctx);
     }
 
     js_free_rt(rt, current);
@@ -557,7 +593,6 @@ qjs_xml_node_make(JSContext *cx, qjs_xml_doc_t *doc, xmlNode *node)
 
     current->node = node;
     current->doc = doc;
-    doc->ref_count++;
 
     ret = JS_NewObjectClass(cx, QJS_CORE_CLASS_ID_XML_NODE);
     if (JS_IsException(ret)) {
@@ -565,6 +600,7 @@ qjs_xml_node_make(JSContext *cx, qjs_xml_doc_t *doc, xmlNode *node)
         return ret;
     }
 
+    doc->ref_count++;
     JS_SetOpaque(ret, current);
 
     return ret;
@@ -672,16 +708,29 @@ qjs_xml_node_attr_handler(JSContext *cx, qjs_xml_node_t *current,
             continue;
         }
 
-        if (attr->children != NULL
-            && attr->children->next == NULL
-            && attr->children->type == XML_TEXT_NODE
-            && attr->children->content != NULL)
-        {
-            return JS_NewString(cx, (char *) attr->children->content);
-        }
+        return qjs_xml_attr_value(cx, attr);
     }
 
     return JS_UNDEFINED;
+}
+
+
+static JSValue
+qjs_xml_attr_value(JSContext *cx, xmlAttr *attr)
+{
+    JSValue  value;
+    xmlChar  *text;
+
+    text = xmlNodeGetContent((xmlNode *) attr);
+    if (text == NULL) {
+        JS_ThrowInternalError(cx, "xmlNodeGetContent() failed");
+        return JS_EXCEPTION;
+    }
+
+    value = JS_NewString(cx, (char *) text);
+    xmlFree(text);
+
+    return value;
 }
 
 
@@ -698,6 +747,11 @@ qjs_xml_node_attr_modify(JSContext *cx, JSValue current, const u_char *name,
         return -1;
     }
 
+    if (!qjs_xml_node_is_live(node->node)) {
+        JS_ThrowTypeError(cx, "XMLNode is detached");
+        return -1;
+    }
+
     if (xmlValidateQName(name, 0) != 0) {
         JS_ThrowTypeError(cx, "attribute name \"%s\" is not valid", name);
         return -1;
@@ -711,6 +765,11 @@ qjs_xml_node_attr_modify(JSContext *cx, JSValue current, const u_char *name,
         }
 
         return 1;
+    }
+
+    if (!JS_IsString(setval)) {
+        JS_ThrowTypeError(cx, "setval is not a string");
+        return -1;
     }
 
     value = (const u_char *) JS_ToCString(cx, setval);
@@ -731,10 +790,9 @@ qjs_xml_node_attr_modify(JSContext *cx, JSValue current, const u_char *name,
 
 static int
 qjs_xml_node_tag_modify(JSContext *cx, JSValue obj, njs_str_t *name,
-    JSValue setval)
+    int delete)
 {
-    size_t          size;
-    xmlNode         *node, *next, *copy;
+    xmlNode         *node;
     qjs_xml_node_t  *current;
 
     current = JS_GetOpaque(obj, QJS_CORE_CLASS_ID_XML_NODE);
@@ -742,42 +800,38 @@ qjs_xml_node_tag_modify(JSContext *cx, JSValue obj, njs_str_t *name,
         return -1;
     }
 
-    if (!JS_IsNullOrUndefined(setval)) {
+    if (!qjs_xml_node_is_live(current->node)) {
+        JS_ThrowTypeError(cx, "XMLNode is detached");
+        return -1;
+    }
+
+    if (!delete) {
         JS_ThrowTypeError(cx, "XMLNode.$tag$xxx is not assignable, "
                           "use addChild() or node.$tags = [node1, node2, ..] "
                           "syntax");
         return -1;
     }
 
-    copy = xmlDocCopyNode(current->node, current->doc->doc, 1);
-    if (copy == NULL) {
-        JS_ThrowInternalError(cx, "xmlDocCopyNode() failed");
-        return -1;
-    }
-
-    for (node = copy->children; node != NULL; node = next) {
-        next = node->next;
-
-        if (node->type != XML_ELEMENT_NODE) {
-            continue;
+    if (name->length == 0) {
+        if (current->node->children != NULL) {
+            return qjs_xml_list_retire(cx, current->doc, current->node, NULL);
         }
 
-        size = njs_strlen(node->name);
+        return 1;
+    }
 
-        if (name->length > 0
-            && (name->length != size
-                || njs_strncmp(name->start, node->name, size) != 0))
+    for (node = current->node->children; node != NULL; node = node->next) {
+        if (node->type == XML_ELEMENT_NODE
+            && name->length == njs_strlen(node->name)
+            && njs_strncmp(name->start, node->name, name->length) == 0)
         {
-            continue;
+            break;
         }
-
-        xmlUnlinkNode(node);
-
-        node->next = current->doc->free;
-        current->doc->free = node;
     }
 
-    qjs_xml_replace_node(cx, current, copy);
+    if (node != NULL) {
+        return qjs_xml_list_retire(cx, current->doc, current->node, name);
+    }
 
     return 1;
 }
@@ -787,14 +841,34 @@ static int
 qjs_xml_node_tags_modify(JSContext *cx, JSValue obj, njs_str_t *name,
     JSValue setval)
 {
-    int32_t         len, i;
-    xmlNode         *node, *rnode, *copy;
     JSValue         length, v;
+    xmlNode         *first, *last, *node;
+    uint32_t        len, i;
     qjs_xml_node_t  *current;
 
     current = JS_GetOpaque(obj, QJS_CORE_CLASS_ID_XML_NODE);
     if (current == NULL) {
         return -1;
+    }
+
+    if (!qjs_xml_node_is_live(current->node)) {
+        JS_ThrowTypeError(cx, "XMLNode is detached");
+        return -1;
+    }
+
+    if (name->length > 0) {
+        JS_ThrowTypeError(cx, "XMLNode $tags$xxx is not assignable, use "
+                          "addChild() or node.$tags = [node1, node2, ..] "
+                          "syntax");
+        return -1;
+    }
+
+    if (JS_IsNullOrUndefined(setval)) {
+        if (current->node->children == NULL) {
+            return 1;
+        }
+
+        return qjs_xml_list_retire(cx, current->doc, current->node, NULL);
     }
 
     if (!qjs_is_array(cx, setval)) {
@@ -807,16 +881,15 @@ qjs_xml_node_tags_modify(JSContext *cx, JSValue obj, njs_str_t *name,
         return -1;
     }
 
-    if (JS_ToInt32(cx, &len, length) < 0) {
+    if (JS_ToUint32(cx, &len, length) < 0) {
+        JS_FreeValue(cx, length);
         return -1;
     }
 
-    copy = xmlDocCopyNode(current->node, current->doc->doc,
-                          2 /* copy properties and namespaces */);
-    if (copy == NULL) {
-        JS_ThrowInternalError(cx, "xmlDocCopyNode() failed");
-        return -1;
-    }
+    JS_FreeValue(cx, length);
+
+    first = NULL;
+    last = NULL;
 
     for (i = 0; i < len; i++) {
         v = JS_GetPropertyUint32(cx, setval, i);
@@ -825,37 +898,61 @@ qjs_xml_node_tags_modify(JSContext *cx, JSValue obj, njs_str_t *name,
         }
 
         node = qjs_xml_node(cx, v, NULL);
-        JS_FreeValue(cx, v);
         if (node == NULL) {
+            JS_FreeValue(cx, v);
+            goto error;
+        }
+
+        if (qjs_xml_tree_has_namespaces(node)) {
+            JS_FreeValue(cx, v);
+            JS_ThrowTypeError(cx, "setval[%u] has namespaces", i);
             goto error;
         }
 
         node = xmlDocCopyNode(node, current->doc->doc, 1);
+        JS_FreeValue(cx, v);
         if (node == NULL) {
             JS_ThrowInternalError(cx, "xmlDocCopyNode() failed");
             goto error;
         }
 
-        rnode = xmlAddChild(copy, node);
-        if (rnode == NULL) {
-            xmlFreeNode(node);
-            JS_ThrowInternalError(cx, "xmlAddChild() failed");
+        node->parent = NULL;
+        node->prev = last;
+        node->next = NULL;
+
+        if (last != NULL) {
+            last->next = node;
+
+        } else {
+            first = node;
+        }
+
+        last = node;
+    }
+
+    if (!qjs_xml_node_is_live(current->node)) {
+        JS_ThrowTypeError(cx, "XMLNode is detached");
+        goto error;
+    }
+
+    if (current->node->children != NULL) {
+        if (qjs_xml_list_retire(cx, current->doc, current->node, NULL) < 0) {
             goto error;
         }
     }
 
-    if (xmlReconciliateNs(current->doc->doc, copy) == -1) {
-        JS_ThrowInternalError(cx, "xmlReconciliateNs() failed");
-        goto error;
-    }
+    current->node->children = first;
+    current->node->last = last;
 
-    qjs_xml_replace_node(cx, current, copy);
+    for (node = first; node != NULL; node = node->next) {
+        node->parent = current->node;
+    }
 
     return 1;
 
 error:
 
-    xmlFreeNode(copy);
+    xmlFreeNodeList(first);
 
     return -1;
 }
@@ -864,51 +961,101 @@ error:
 static int
 qjs_xml_node_text_handler(JSContext *cx, JSValue current, JSValue setval)
 {
-    xmlNode         *copy;
-    njs_str_t       content, enc;
+    xmlNode         *text;
+    njs_str_t       content;
     qjs_xml_node_t  *node;
 
-    enc.start = NULL;
-    enc.length = 0;
+    content.start = NULL;
+    content.length = 0;
 
     node = JS_GetOpaque(current, QJS_CORE_CLASS_ID_XML_NODE);
     if (node == NULL) {
         return -1;
     }
 
+    if (!qjs_xml_node_is_live(node->node)) {
+        JS_ThrowTypeError(cx, "XMLNode is detached");
+        return -1;
+    }
+
     if (!JS_IsNullOrUndefined(setval)) {
+        if (!JS_IsString(setval)) {
+            JS_ThrowTypeError(cx, "setval is not a string");
+            return -1;
+        }
+
         content.start = (u_char *) JS_ToCStringLen(cx, &content.length, setval);
         if (content.start == NULL) {
             return -1;
         }
 
-        if (qjs_xml_encode_special_chars(cx, &content, &enc) < 0) {
+        if (memchr(content.start, '\0', content.length) != NULL) {
             JS_FreeCString(cx, (char *) content.start);
+            JS_ThrowTypeError(cx, "setval contains NUL");
             return -1;
         }
+    }
 
+    text = NULL;
+    if (!JS_IsNullOrUndefined(setval)) {
+        text = xmlNewDocTextLen(node->doc->doc, content.start, content.length);
         JS_FreeCString(cx, (char *) content.start);
-    }
-
-    copy = xmlDocCopyNode(node->node, node->doc->doc, 1);
-    if (copy == NULL) {
-        if (enc.start != NULL) {
-            js_free(cx, enc.start);
+        if (text == NULL) {
+            JS_ThrowInternalError(cx, "xmlNewDocTextLen() failed");
+            return -1;
         }
-
-        JS_ThrowInternalError(cx, "xmlDocCopyNode() failed");
-        return -1;
     }
 
-    xmlNodeSetContentLen(copy, enc.start, enc.length);
-
-    if (enc.start != NULL) {
-        js_free(cx, enc.start);
+    if (node->node->children != NULL) {
+        if (qjs_xml_list_retire(cx, node->doc, node->node, NULL) < 0) {
+            xmlFreeNode(text);
+            return -1;
+        }
     }
 
-    qjs_xml_replace_node(cx, node, copy);
+    if (text != NULL) {
+        qjs_xml_list_append(node->node, text);
+    }
 
     return 1;
+}
+
+
+static int
+qjs_xml_node_has_method(JSContext *cx, JSValueConst obj, JSAtom prop,
+    njs_str_t *name)
+{
+    int                         rc;
+    size_t                      i, length;
+    JSValue                     proto;
+    const JSCFunctionListEntry  *entry;
+
+    for (i = 0; i < njs_nitems(qjs_xml_node_proto); i++) {
+        entry = &qjs_xml_node_proto[i];
+
+        if (entry->def_type != JS_DEF_CFUNC) {
+            continue;
+        }
+
+        length = njs_strlen(entry->name);
+
+        if (name->length == length
+            && njs_strncmp(name->start, entry->name, length) == 0)
+        {
+            proto = JS_GetPrototype(cx, obj);
+            if (JS_IsException(proto)) {
+                return -1;
+            }
+
+            rc = JS_IsObject(proto) ? JS_GetOwnProperty(cx, NULL, proto, prop)
+                                    : 0;
+            JS_FreeValue(cx, proto);
+
+            return rc;
+        }
+    }
+
+    return 0;
 }
 
 
@@ -916,6 +1063,7 @@ static int
 qjs_xml_node_get_own_property(JSContext *cx, JSPropertyDescriptor *pdesc,
     JSValueConst obj, JSAtom prop)
 {
+    int             rc;
     u_char          *text;
     JSValue         value;
     xmlNode         *node;
@@ -982,12 +1130,15 @@ qjs_xml_node_get_own_property(JSContext *cx, JSPropertyDescriptor *pdesc,
                 return 0;
             }
 
-            if (pdesc != NULL) {
-                pdesc->flags = JS_PROP_ENUMERABLE;
-                pdesc->getter = JS_UNDEFINED;
-                pdesc->setter = JS_UNDEFINED;
-                pdesc->value  = value;
+            if (pdesc == NULL) {
+                JS_FreeValue(cx, value);
+                return 1;
             }
+
+            pdesc->flags = JS_PROP_ENUMERABLE;
+            pdesc->getter = JS_UNDEFINED;
+            pdesc->setter = JS_UNDEFINED;
+            pdesc->value  = value;
 
             return 1;
         }
@@ -1094,12 +1245,15 @@ qjs_xml_node_get_own_property(JSContext *cx, JSPropertyDescriptor *pdesc,
                 return -1;
             }
 
-            if (pdesc != NULL) {
-                pdesc->flags = JS_PROP_ENUMERABLE;
-                pdesc->getter = JS_UNDEFINED;
-                pdesc->setter = JS_UNDEFINED;
-                pdesc->value = value;
+            if (pdesc == NULL) {
+                JS_FreeValue(cx, value);
+                return 1;
             }
+
+            pdesc->flags = JS_PROP_ENUMERABLE;
+            pdesc->getter = JS_UNDEFINED;
+            pdesc->setter = JS_UNDEFINED;
+            pdesc->value = value;
 
             return 1;
         }
@@ -1141,6 +1295,12 @@ qjs_xml_node_get_own_property(JSContext *cx, JSPropertyDescriptor *pdesc,
 
     nm = name;
 
+    rc = qjs_xml_node_has_method(cx, obj, prop, &name);
+    if (rc != 0) {
+        JS_FreeCString(cx, (char *) name.start);
+        return rc < 0 ? -1 : 0;
+    }
+
 tag:
 
     value = qjs_xml_node_tag_handler(cx, current, &nm);
@@ -1153,12 +1313,15 @@ tag:
         return 0;
     }
 
-    if (pdesc != NULL) {
-        pdesc->flags = JS_PROP_ENUMERABLE;
-        pdesc->getter = JS_UNDEFINED;
-        pdesc->setter = JS_UNDEFINED;
-        pdesc->value  = value;
+    if (pdesc == NULL) {
+        JS_FreeValue(cx, value);
+        return 1;
     }
+
+    pdesc->flags = JS_PROP_ENUMERABLE;
+    pdesc->getter = JS_UNDEFINED;
+    pdesc->setter = JS_UNDEFINED;
+    pdesc->value  = value;
 
     return 1;
 }
@@ -1239,23 +1402,28 @@ static int
 qjs_xml_node_set_property(JSContext *cx, JSValueConst obj, JSAtom atom,
     JSValueConst value, JSValueConst receiver, int flags)
 {
-    return qjs_xml_node_define_own_property(cx, obj, atom, value,
-                                            JS_UNDEFINED, JS_UNDEFINED, flags);
+    return qjs_xml_node_property_modify(cx, obj, atom, value, 0);
 }
 
 
 static int
 qjs_xml_node_delete_property(JSContext *cx, JSValueConst obj, JSAtom prop)
 {
-    return qjs_xml_node_define_own_property(cx, obj, prop, JS_UNDEFINED,
-                                        JS_UNDEFINED, JS_UNDEFINED,
-                                        JS_PROP_THROW);
+    return qjs_xml_node_property_modify(cx, obj, prop, JS_UNDEFINED, 1);
 }
 
 
 static int
 qjs_xml_node_define_own_property(JSContext *cx, JSValueConst obj, JSAtom atom,
     JSValueConst value, JSValueConst getter, JSValueConst setter, int flags)
+{
+    return qjs_xml_node_property_modify(cx, obj, atom, value, 0);
+}
+
+
+static int
+qjs_xml_node_property_modify(JSContext *cx, JSValueConst obj, JSAtom atom,
+    JSValueConst value, int delete)
 {
     int        rc;
     njs_str_t  name, nm;
@@ -1286,7 +1454,7 @@ qjs_xml_node_define_own_property(JSContext *cx, JSValueConst obj, JSAtom atom,
             nm.start = name.start + njs_length("$tag$");
             nm.length = name.length - njs_length("$tag$");
 
-            rc = qjs_xml_node_tag_modify(cx, obj, &nm, value);
+            rc = qjs_xml_node_tag_modify(cx, obj, &nm, delete);
 
             JS_FreeCString(cx, (char *) name.start);
 
@@ -1328,7 +1496,15 @@ qjs_xml_node_define_own_property(JSContext *cx, JSValueConst obj, JSAtom atom,
         }
     }
 
-    rc = qjs_xml_node_tag_modify(cx, obj, &name, value);
+    if (delete) {
+        rc = qjs_xml_node_has_method(cx, obj, atom, &name);
+        if (rc != 0) {
+            JS_FreeCString(cx, (char *) name.start);
+            return rc < 0 ? -1 : 1;
+        }
+    }
+
+    rc = qjs_xml_node_tag_modify(cx, obj, &name, delete);
     JS_FreeCString(cx, (char *) name.start);
 
     return rc;
@@ -1336,10 +1512,80 @@ qjs_xml_node_define_own_property(JSContext *cx, JSValueConst obj, JSAtom atom,
 
 
 static JSValue
+qjs_xml_node_get_attribute_ns(JSContext *cx, JSValueConst this_val,
+    int argc, JSValueConst *argv)
+{
+    xmlAttr         *attr;
+    xmlChar         *text;
+    JSValue         value;
+    njs_str_t       uri, local;
+    qjs_xml_node_t  *current;
+
+    current = qjs_xml_ns_args(cx, this_val, argv, &uri, &local);
+    if (current == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    value = JS_UNDEFINED;
+
+    for (attr = current->node->properties; attr != NULL; attr = attr->next) {
+        if (!qjs_xml_ns_match(attr->name, attr->ns, &uri, &local)) {
+            continue;
+        }
+
+        text = xmlNodeGetContent((xmlNode *) attr);
+        if (text == NULL) {
+            value = JS_ThrowInternalError(cx, "xmlNodeGetContent() failed");
+            break;
+        }
+
+        value = JS_NewString(cx, (char *) text);
+        xmlFree(text);
+        break;
+    }
+
+    qjs_xml_ns_args_free(cx, &uri, &local);
+
+    return value;
+}
+
+
+static JSValue
+qjs_xml_node_get_child_ns(JSContext *cx, JSValueConst this_val,
+    int argc, JSValueConst *argv)
+{
+    JSValue         value;
+    xmlNode         *node;
+    njs_str_t       uri, local;
+    qjs_xml_node_t  *current;
+
+    current = qjs_xml_ns_args(cx, this_val, argv, &uri, &local);
+    if (current == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    value = JS_UNDEFINED;
+
+    for (node = current->node->children; node != NULL; node = node->next) {
+        if (node->type == XML_ELEMENT_NODE
+            && qjs_xml_ns_match(node->name, node->ns, &uri, &local))
+        {
+            value = qjs_xml_node_make(cx, current->doc, node);
+            break;
+        }
+    }
+
+    qjs_xml_ns_args_free(cx, &uri, &local);
+
+    return value;
+}
+
+
+static JSValue
 qjs_xml_node_add_child(JSContext *cx, JSValueConst this_val,
     int argc, JSValueConst *argv)
 {
-    xmlNode         *copy, *node, *rnode;
+    xmlNode         *node;
     qjs_xml_node_t  *current;
 
     current = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_XML_NODE);
@@ -1348,44 +1594,30 @@ qjs_xml_node_add_child(JSContext *cx, JSValueConst this_val,
         return JS_EXCEPTION;
     }
 
+    if (!qjs_xml_node_is_live(current->node)) {
+        JS_ThrowTypeError(cx, "XMLNode is detached");
+        return JS_EXCEPTION;
+    }
+
     node = qjs_xml_node(cx, argv[0], NULL);
     if (node == NULL) {
         return JS_EXCEPTION;
     }
 
-    copy = xmlDocCopyNode(current->node, current->doc->doc, 1);
-    if (copy == NULL) {
-        JS_ThrowInternalError(cx, "xmlDocCopyNode() failed");
+    if (qjs_xml_tree_has_namespaces(node)) {
+        JS_ThrowTypeError(cx, "XMLNode has namespaces");
         return JS_EXCEPTION;
     }
 
     node = xmlDocCopyNode(node, current->doc->doc, 1);
     if (node == NULL) {
         JS_ThrowInternalError(cx, "xmlDocCopyNode() failed");
-        goto error;
+        return JS_EXCEPTION;
     }
 
-    rnode = xmlAddChild(copy, node);
-    if (rnode == NULL) {
-        xmlFreeNode(node);
-        JS_ThrowInternalError(cx, "xmlAddChild() failed");
-        goto error;
-    }
-
-    if (xmlReconciliateNs(current->doc->doc, copy) == -1) {
-        JS_ThrowInternalError(cx, "xmlReconciliateNs() failed");
-        goto error;
-    }
-
-    qjs_xml_replace_node(cx, current, copy);
+    qjs_xml_list_append(current->node, node);
 
     return JS_UNDEFINED;
-
-error:
-
-    xmlFreeNode(copy);
-
-    return JS_EXCEPTION;
 }
 
 
@@ -1421,7 +1653,7 @@ qjs_xml_node_remove_children(JSContext *cx, JSValueConst this_val,
         name.length = 0;
     }
 
-    rc = qjs_xml_node_tag_modify(cx, this_val, &name, JS_UNDEFINED);
+    rc = qjs_xml_node_tag_modify(cx, this_val, &name, 1);
 
     if (name.start != NULL) {
         JS_FreeCString(cx, (char *) name.start);
@@ -1493,6 +1725,11 @@ qjs_xml_node_remove_all_attributes(JSContext *cx, JSValueConst this_val,
     current = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_XML_NODE);
     if (current == NULL) {
         JS_ThrowTypeError(cx, "\"this\" is not a XMLNode object");
+        return JS_EXCEPTION;
+    }
+
+    if (!qjs_xml_node_is_live(current->node)) {
+        JS_ThrowTypeError(cx, "XMLNode is detached");
         return JS_EXCEPTION;
     }
 
@@ -1587,7 +1824,6 @@ qjs_xml_attr_make(JSContext *cx, qjs_xml_doc_t *doc, xmlNode *node)
 
     current->node = node;
     current->doc = doc;
-    doc->ref_count++;
 
     ret = JS_NewObjectClass(cx, QJS_CORE_CLASS_ID_XML_ATTR);
     if (JS_IsException(ret)) {
@@ -1595,6 +1831,7 @@ qjs_xml_attr_make(JSContext *cx, qjs_xml_doc_t *doc, xmlNode *node)
         return ret;
     }
 
+    doc->ref_count++;
     JS_SetOpaque(ret, current);
 
     return ret;
@@ -1606,7 +1843,6 @@ qjs_xml_attr_get_own_property(JSContext *cx, JSPropertyDescriptor *pdesc,
     JSValueConst obj, JSAtom prop)
 {
     size_t          size;
-    u_char          *text;
     xmlAttr         *attr;
     njs_str_t       name;
     qjs_xml_attr_t  *current;
@@ -1639,23 +1875,15 @@ qjs_xml_attr_get_own_property(JSContext *cx, JSPropertyDescriptor *pdesc,
 
         JS_FreeCString(cx, (char *) name.start);
 
-        text = xmlNodeGetContent(attr->children);
-        if (text == NULL) {
-            return 0;
-        }
-
         if (pdesc != NULL) {
             pdesc->flags = JS_PROP_ENUMERABLE;
             pdesc->getter = JS_UNDEFINED;
             pdesc->setter = JS_UNDEFINED;
-            pdesc->value  = JS_NewString(cx, (char *) text);
+            pdesc->value = qjs_xml_attr_value(cx, attr);
             if (JS_IsException(pdesc->value)) {
-                xmlFree(text);
                 return -1;
             }
         }
-
-        xmlFree(text);
 
         return 1;
     }
@@ -1955,115 +2183,255 @@ qjs_xml_nset_free(JSContext *cx, qjs_xml_nset_t *nset)
 }
 
 
-static int
-qjs_xml_encode_special_chars(JSContext *cx, njs_str_t *src, njs_str_t *out)
+static qjs_xml_node_t *
+qjs_xml_ns_args(JSContext *cx, JSValueConst this_val, JSValueConst *argv,
+    njs_str_t *uri, njs_str_t *local)
 {
-    size_t  len;
-    u_char  *p, *dst, *end;
+    size_t          length;
+    qjs_xml_node_t  *current;
 
-    len = 0;
-    end = src->start + src->length;
-
-    for (p = src->start; p < end; p++) {
-        if (*p == '<' || *p == '>') {
-            len += njs_length("&lt");
-        }
-
-        if (*p == '&' || *p == '\r') {
-            len += njs_length("&amp");
-        }
-
-        if (*p == '"') {
-            len += njs_length("&quot");
-        }
-
-        len += 1;
+    current = JS_GetOpaque(this_val, QJS_CORE_CLASS_ID_XML_NODE);
+    if (current == NULL) {
+        JS_ThrowTypeError(cx, "\"this\" is not a XMLNode object");
+        return NULL;
     }
 
-    if (len == 0) {
-        out->start = NULL;
-        out->length = 0;
+    if (!JS_IsNull(argv[0]) && !JS_IsString(argv[0])) {
+        JS_ThrowTypeError(cx, "namespace URI is not a string or null");
+        return NULL;
+    }
 
+    if (!JS_IsString(argv[1])) {
+        JS_ThrowTypeError(cx, "local name is not a string");
+        return NULL;
+    }
+
+    uri->start = NULL;
+    uri->length = 0;
+
+    if (JS_IsString(argv[0])) {
+        uri->start = (u_char *) JS_ToCStringLen(cx, &length, argv[0]);
+        if (uri->start == NULL) {
+            return NULL;
+        }
+
+        uri->length = length;
+    }
+
+    local->start = (u_char *) JS_ToCStringLen(cx, &length, argv[1]);
+    if (local->start == NULL) {
+        if (uri->start != NULL) {
+            JS_FreeCString(cx, (char *) uri->start);
+        }
+
+        return NULL;
+    }
+
+    local->length = length;
+
+    return current;
+}
+
+
+static void
+qjs_xml_ns_args_free(JSContext *cx, njs_str_t *uri, njs_str_t *local)
+{
+    if (uri->start != NULL) {
+        JS_FreeCString(cx, (char *) uri->start);
+    }
+
+    JS_FreeCString(cx, (char *) local->start);
+}
+
+
+/*
+ * An empty or null URI matches only names without a namespace, as in
+ * DOM getAttributeNS().
+ */
+
+static int
+qjs_xml_ns_match(const xmlChar *name, xmlNs *ns, njs_str_t *uri,
+    njs_str_t *local)
+{
+    if (local->length != njs_strlen(name)
+        || njs_strncmp(local->start, name, local->length) != 0)
+    {
         return 0;
     }
 
-    out->start = js_malloc(cx, len);
-    if (out->start == NULL) {
+    if (ns == NULL || ns->href == NULL) {
+        return uri->length == 0;
+    }
+
+    return uri->length == njs_strlen(ns->href)
+           && njs_strncmp(uri->start, ns->href, uri->length) == 0;
+}
+
+
+static int
+qjs_xml_node_is_live(xmlNode *node)
+{
+    xmlNode  *parent;
+
+    if (node == NULL || node->doc == NULL) {
+        return 0;
+    }
+
+    for (parent = node->parent; parent != NULL; parent = parent->parent) {
+        if (parent == (xmlNode *) node->doc) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static xmlNode *
+qjs_xml_list_detach(xmlNode *parent, njs_str_t *name)
+{
+    xmlNode  *node, *next, *first, *last, *keep_first, *keep_last;
+
+    if (name == NULL) {
+        first = parent->children;
+        parent->children = NULL;
+        parent->last = NULL;
+
+        for (node = first; node != NULL; node = node->next) {
+            node->parent = NULL;
+        }
+
+        return first;
+    }
+
+    first = NULL;
+    last = NULL;
+    keep_first = NULL;
+    keep_last = NULL;
+
+    for (node = parent->children; node != NULL; node = next) {
+        next = node->next;
+
+        if (node->type == XML_ELEMENT_NODE
+            && name->length == njs_strlen(node->name)
+            && njs_strncmp(name->start, node->name, name->length) == 0)
+        {
+            node->parent = NULL;
+            node->prev = last;
+            node->next = NULL;
+
+            if (last != NULL) {
+                last->next = node;
+
+            } else {
+                first = node;
+            }
+
+            last = node;
+
+        } else {
+            node->parent = parent;
+            node->prev = keep_last;
+            node->next = NULL;
+
+            if (keep_last != NULL) {
+                keep_last->next = node;
+
+            } else {
+                keep_first = node;
+            }
+
+            keep_last = node;
+        }
+    }
+
+    parent->children = keep_first;
+    parent->last = keep_last;
+
+    return first;
+}
+
+
+static int
+qjs_xml_list_retire(JSContext *cx, qjs_xml_doc_t *doc, xmlNode *parent,
+    njs_str_t *name)
+{
+    qjs_xml_retired_t  *retired;
+
+    retired = js_malloc(cx, sizeof(qjs_xml_retired_t));
+    if (retired == NULL) {
         JS_ThrowOutOfMemory(cx);
         return -1;
     }
 
-    dst = out->start;
+    retired->nodes = qjs_xml_list_detach(parent, name);
+    retired->next = doc->retired;
+    doc->retired = retired;
 
-    for (p = src->start; p < end; p++) {
-        if (*p == '<') {
-            *dst++ = '&';
-            *dst++ = 'l';
-            *dst++ = 't';
-            *dst++ = ';';
+    return 1;
+}
 
-        } else if (*p == '>') {
-            *dst++ = '&';
-            *dst++ = 'g';
-            *dst++ = 't';
-            *dst++ = ';';
 
-        } else if (*p == '&') {
-            *dst++ = '&';
-            *dst++ = 'a';
-            *dst++ = 'm';
-            *dst++ = 'p';
-            *dst++ = ';';
+static void
+qjs_xml_list_append(xmlNode *parent, xmlNode *node)
+{
+    node->parent = parent;
+    node->prev = parent->last;
+    node->next = NULL;
 
-        } else if (*p == '"') {
-            *dst++ = '&';
-            *dst++ = 'q';
-            *dst++ = 'u';
-            *dst++ = 'o';
-            *dst++ = 't';
-            *dst++ = ';';
+    if (parent->last != NULL) {
+        parent->last->next = node;
 
-        } else if (*p == '\r') {
-            *dst++ = '&';
-            *dst++ = '#';
-            *dst++ = '1';
-            *dst++ = '3';
-            *dst++ = ';';
+    } else {
+        parent->children = node;
+    }
 
-        } else {
-            *dst++ = *p;
+    parent->last = node;
+}
+
+
+static int
+qjs_xml_tree_has_namespaces(xmlNode *node)
+{
+    xmlAttr  *attr;
+    xmlNode  *child;
+
+    switch (node->type) {
+    case XML_ELEMENT_NODE:
+        break;
+
+    case XML_TEXT_NODE:
+    case XML_CDATA_SECTION_NODE:
+    case XML_PI_NODE:
+    case XML_COMMENT_NODE:
+        return 0;
+
+    default:
+        return 1;
+    }
+
+    if (node->ns != NULL || node->nsDef != NULL) {
+        return 1;
+    }
+
+    for (attr = node->properties; attr != NULL; attr = attr->next) {
+        if (attr->ns != NULL) {
+            return 1;
         }
     }
 
-    out->length = len;
+    for (child = node->children; child != NULL; child = child->next) {
+        if (qjs_xml_tree_has_namespaces(child)) {
+            return 1;
+        }
+    }
 
     return 0;
 }
 
 
 static void
-qjs_xml_replace_node(JSContext *cx, qjs_xml_node_t *node, xmlNode *current)
-{
-    xmlNode  *old;
-
-    old = node->node;
-
-    if (current != NULL) {
-        old = xmlReplaceNode(old, current);
-
-    } else {
-        xmlUnlinkNode(old);
-    }
-
-    node->node = current;
-
-    old->next = node->doc->free;
-    node->doc->free = old;
-}
-
-
-static void
-qjs_xml_error(JSContext *cx, qjs_xml_doc_t *current, const char *fmt, ...)
+qjs_xml_error(JSContext *cx, xmlParserCtxt *ctx, const char *fmt, ...)
 {
     u_char          *p, *last;
     va_list         args;
@@ -2076,7 +2444,7 @@ qjs_xml_error(JSContext *cx, qjs_xml_doc_t *current, const char *fmt, ...)
     p = njs_vsprintf(errstr, last - 1, fmt, args);
     va_end(args);
 
-    err = xmlCtxtGetLastError(current->ctx);
+    err = xmlCtxtGetLastError(ctx);
 
     if (err != NULL) {
         p = njs_sprintf(p, last - 1, " (libxml2: \"%*s\" at %d:%d)",

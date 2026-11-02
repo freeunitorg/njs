@@ -1158,6 +1158,22 @@ static njs_unit_test_t  njs_test[] =
     { njs_str("var a = 1; function f(x) { a = x; return 2 }; a += f(5)"),
       njs_str("3") },
 
+    { njs_str("var src = 'var a=1;return a+' + '('.repeat(256)"
+              "+ '0+'.repeat(256) + '(a=2)' + ')'.repeat(256);"
+              "(new Function(src))()"),
+      njs_str("3") },
+
+    { njs_str("var src = 'var a=1;a+=' + '('.repeat(256)"
+              "+ '0+'.repeat(256) + '(a=2)' + ')'.repeat(256) + ';return a';"
+              "(new Function(src))()"),
+      njs_str("3") },
+
+    { njs_str("var src = 'var i=0,a=[];a[i]=' + '['.repeat(256)"
+              "+ '(i=1)' + ']'.repeat(256)"
+              "+ ';return a[0] !== undefined && a[1] === undefined';"
+              "(new Function(src))()"),
+      njs_str("true") },
+
     { njs_str("var x; x in (x = 1, [1, 2, 3])"),
       njs_str("false") },
 
@@ -3403,11 +3419,56 @@ static njs_unit_test_t  njs_test[] =
 
     /* for in. */
 
+    /* An invalid for-in target is a SyntaxError, parenthesized or not. */
+
     { njs_str("for (null in undefined);"),
-      njs_str("ReferenceError: Invalid left-hand side \"null\" in for-in statement") },
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for ((null) in undefined);"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for (1 in {});"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for (this in {});"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for (function(){} in x);"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for ((a = 1) in {});"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for ((x => x) in {});"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("var r; try { Function('for (null in undefined);') }"
+              "catch (e) { r = e.name } r"),
+      njs_str("SyntaxError") },
+
+    { njs_str("var d = {}; for (d.a in {x:1}); d.a"),
+      njs_str("x") },
+
+    { njs_str("var d = {}; for ((d.a) in {x:1}); d.a"),
+      njs_str("x") },
 
     { njs_str("for (var a, b in []);"),
-      njs_str("SyntaxError: Unexpected token \"in\"") },
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for (var x = 0 in o);"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    /* [+In] is restored past the initializer. */
+
+    { njs_str("var b = 'a', c = {a:1}, n = 0;"
+              "for (var k in b in c) { n++ } n"),
+      njs_str("0") },
+
+    { njs_str("var a = 0; for (; 1 in [1]; 1 in [1]) break; a"),
+      njs_str("0") },
+
+    { njs_str("var a = 0; for (a < 1 in {};;) break; a"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
 
     { njs_str("var s = ''; for (var p in [1,2]) {s += p}; s"),
       njs_str("01") },
@@ -3417,6 +3478,53 @@ static njs_unit_test_t  njs_test[] =
 
     { njs_str("var s = ''; for (var p in {a:1, b:2}) {s += p}; s"),
       njs_str("ab") },
+
+    /*
+     * A declaration header is parsed once, under [~In], and classified by the
+     * token it stopped at, like an expression header.
+     */
+
+    { njs_str("for (let a, b in []);"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for (let a = 0 in {});"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for (const a = 0 in {});"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for (var a = 0, b in {});"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("var s = ''; for (const k in {a:1, b:2}) {s += k}; s"),
+      njs_str("ab") },
+
+    /* The three for-in target routes, each observed over two iterations. */
+
+    { njs_str("var r = []; for (let k in {a:1, b:2}) {r.push(() => k)};"
+              "r[0]() + ',' + r[1]()"),
+      njs_str("a,b") },
+
+    { njs_str("var r = []; for (var k in {a:1, b:2}) {r.push(() => k)};"
+              "r[0]() + ',' + r[1]()"),
+      njs_str("b,b") },
+
+    { njs_str("var k, s = ''; for (k in {a:1, b:2}) {s += k}; s + k"),
+      njs_str("abb") },
+
+    { njs_str("var o = {}, s = ''; for (o.p in {a:1, b:2}) {s += o.p};"
+              "s + o.p"),
+      njs_str("abb") },
+
+    { njs_str("var o = [], s = ''; for (o[0] in {a:1, b:2}) {s += o[0]};"
+              "s + o[0]"),
+      njs_str("abb") },
+
+    { njs_str("var k, s = ''; for ((k) in {a:1, b:2}) {s += k}; s + k"),
+      njs_str("abb") },
+
+    { njs_str("var s = 'x'; for (let k in {}) {s = 'y'}; s"),
+      njs_str("x") },
 
     { njs_str("var s = '';"
                  "var o = Object.defineProperty({}, 'x', {value:1});"
@@ -3488,6 +3596,56 @@ static njs_unit_test_t  njs_test[] =
     { njs_str("for (in + j;;) {}"),
       njs_str("SyntaxError: Unexpected token \"in\"") },
 
+    { njs_str("for (var x = [1 in {}];;) break;"),
+      njs_str("undefined") },
+
+    { njs_str("for (var x = true ? 1 in {} : 0;;) break;"),
+      njs_str("undefined") },
+
+    /*
+     * A delimiter in the conditional consequent used to desynchronize the
+     * [In] parameter from the parser position.
+     */
+
+    { njs_str("for (a ? (b) : c in d; false;);"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for (a ? b : c in d; false;);"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("var a=1,b=2,c=3; for (a ? (b) : c; false;) break; a"),
+      njs_str("1") },
+
+    /* [+In] regions, past the speculative left-hand side parse. */
+
+    { njs_str("var a=1; for (a, (1 in {});;) break; a"),
+      njs_str("1") },
+
+    { njs_str("var a=1; for (a, `${1 in {}}`;;) break; a"),
+      njs_str("1") },
+
+    { njs_str("var a=1; for (a, function(){ return 1 in {} };;) break; a"),
+      njs_str("1") },
+
+    /* ... and [~In] must be restored after each of them. */
+
+    { njs_str("for (a, [1], b in c;;) break;"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for (a, `${1}`, b in c;;) break;"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    /* An arrow concise body inherits [In], an arrow block body does not. */
+
+    { njs_str("for (x => 1 in {};;) break;"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("for (x => x, 1 in {};;) break;"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("var a=1; for (x => { return 1 in {} };;) break; a"),
+      njs_str("1") },
+
     { njs_str("for (true ? 0 in {}: 0; false; ) ;"),
       njs_str("undefined") },
 
@@ -3529,6 +3687,39 @@ static njs_unit_test_t  njs_test[] =
 
     { njs_str("for(i;;)for(-new+3;;)break;"),
       njs_str("SyntaxError: Unexpected token \"+\"") },
+
+    { njs_str("for(function(){r({/a/;0;1)1"),
+      njs_str("SyntaxError: Unexpected token \"/\"") },
+
+    { njs_str("for(a(function(){r({/a/;0;1)1"),
+      njs_str("SyntaxError: Unexpected token \"/\"") },
+
+    { njs_str("for(async function(){r({/a/;0;1)1"),
+      njs_str("SyntaxError: Unexpected token \"/\"") },
+
+    { njs_str("for({/a/;0;1)1"),
+      njs_str("SyntaxError: Unexpected token \"/\"") },
+
+    { njs_str("for(function f(){}.x in {a:1}); 1"),
+      njs_str("1") },
+
+    { njs_str("var o={}; for(function(){return o}().x in {a:1,b:2}); o.x"),
+      njs_str("b") },
+
+    { njs_str("async function f(){for(await p in o;;)break;} f()"),
+      njs_str("SyntaxError: Invalid left-hand side in for-loop") },
+
+    { njs_str("var a=0; for(-a;;)break; a"),
+      njs_str("0") },
+
+    { njs_str("var a=0; for(typeof a;;)break; a"),
+      njs_str("0") },
+
+    { njs_str("var a=0; for(++a;;)break; a"),
+      njs_str("1") },
+
+    { njs_str("var a={b:0}; for(delete a.b;;)break; a.b"),
+      njs_str("undefined") },
 
     /* switch. */
 
@@ -3797,6 +3988,18 @@ static njs_unit_test_t  njs_test[] =
 
     { njs_str("a : var n = 0; b :++n"),
       njs_str("1") },
+
+    { njs_str("var r = 0; outer: for (;;) { inner: break outer; r++ } r"),
+      njs_str("0") },
+
+    { njs_str("var r = 0; outer: for (; r < 3; r++) {"
+                  "inner: continue outer } r"),
+      njs_str("3") },
+
+    { njs_str("var x = 0, f = () => ++x;"
+                  "a: x = 1; b: x++; c: f(); d: [1,2].length;"
+                  "e: 's'; g: typeof x; x"),
+      njs_str("3") },
 
     { njs_str("a:{a:1}"),
       njs_str("SyntaxError: Label \"a\" has already been declared") },
@@ -4727,6 +4930,25 @@ static njs_unit_test_t  njs_test[] =
     { njs_str("var n = 1, a = [ n += 1 ]; a"),
       njs_str("2") },
 
+    { njs_str("var a = 1; a = [a, 2]"),
+      njs_str("1,2") },
+
+    { njs_str("var a; a = [(a = 1, 2)]"),
+      njs_str("2") },
+
+    { njs_str("var i = 0; [i++, i++, i++]"),
+      njs_str("0,1,2") },
+
+    { njs_str("var a = [, 1, , 2, ,];"
+              "[a.length, Object.keys(a).length, 0 in a, 4 in a]"),
+      njs_str("5,2,false,false") },
+
+    { njs_str("njs.dump([1, [2, [3, 4]], 5])"),
+      njs_str("[1,[2,[3,4]],5]") },
+
+    { njs_str("var a = 1; a += [(a = 5, 1)][0]; a"),
+      njs_str("2") },
+
     { njs_str("var a = [ 1, 2; 3 ]; a[0] + a[1] + a[2]"),
       njs_str("SyntaxError: Unexpected token \";\"") },
 
@@ -4825,6 +5047,11 @@ static njs_unit_test_t  njs_test[] =
 
     { njs_str("[1,2].length"),
       njs_str("2") },
+
+    { njs_str("var src = 'return [' + '1,'.repeat(32760) + '1]';"
+              "var a = Function(src)();"
+              "[a.length, a[0], a[32760], Object.keys(a).length]"),
+      njs_str("32761,1,1,32761") },
 
     { njs_str("var a = [1,2]; a.length"),
       njs_str("2") },
@@ -5017,6 +5244,15 @@ static njs_unit_test_t  njs_test[] =
               "var a2 = [3].concat(a, [4]);"
               "njs.dump(a2)"),
       njs_str("[3,1,<1111110 empty items>,2,4]") },
+
+    { njs_str("var a = []; a[2**32 - 7] = 2; a[2**32 - 2] = 1;"
+              "a.sort(); [a.length, a[0], a[1], Object.keys(a)]"),
+      njs_str("4294967295,1,2,0,1") },
+
+    { njs_str("var a = []; a[100000] = 1;"
+              "var b = [].concat(a, [,, 5]);"
+              "[b.length, Object.keys(b), b[100001], b.sort().length]"),
+      njs_str("100004,100000,100003,,100004") },
 
     { njs_str("var re = /abc/; re[Symbol.isConcatSpreadable] = true;"
               "re[0] = 1, re[1] = 2, re[2] = 3, re.length = 3;"
@@ -6481,6 +6717,16 @@ static njs_unit_test_t  njs_test[] =
               ".map(v=>{var a = new ArrayBuffer(8); return (new v(a).length)})"),
       njs_str("8,8,8,4,4,2,2,2,1") },
 
+    { njs_str("var b = new ArrayBuffer(64); var n = 0;"
+              "var a = new Int8Array(b, 0, {valueOf() { return ++n == 1"
+              " ? 8 : 16 }}); [a.length, n]"),
+      njs_str("8,1") },
+
+    { njs_str("var b = new ArrayBuffer(64);"
+              "new Int8Array(b, 0, {valueOf() { $262.detachArrayBuffer(b);"
+              " return 8 }})"),
+      njs_str("TypeError: detached buffer") },
+
     { njs_str(NJS_TYPED_ARRAY_LIST
               ".map(v=>{var a = new v(1); a[0]--; return a[0]})"),
       njs_str("255,0,-1,65535,-1,4294967295,-1,-1,-1") },
@@ -6820,6 +7066,35 @@ static njs_unit_test_t  njs_test[] =
               ".every(v=>{var init = new v([1,2,3]); var a = new v(4);"
               "           try {a.set(init,Infinity)} catch (e) {return e.name == 'RangeError'};})"),
       njs_str("true") },
+
+    { njs_str("var a = new Uint8Array([1]);"
+              "Object.defineProperty(a, 'x', {enumerable: true,"
+              "  get() { return this === a && this[0]; }});"
+              "Object.values(a)"),
+      njs_str("1,1") },
+
+    { njs_str("var a = new Uint8Array([1]);"
+              "Object.defineProperty(a, 'x', {enumerable: true,"
+              "  get() { this[0] = 2; return this[0]; }});"
+              "Object.values(a); a[0]"),
+      njs_str("2") },
+
+    { njs_str("[257, '257', NaN, 'NaN', Infinity, 'Infinity', -0, '-0']"
+              ".every(k => { try {"
+              "  Object.defineProperty(new Uint8Array(), k, {value: 1});"
+              "} catch (e) { return e.name == 'TypeError'; } })"),
+      njs_str("true") },
+
+    { njs_str("['01', ' 1', '0x10', '1e3'].every(k => {"
+              "var a = new Uint8Array();"
+              "Object.defineProperty(a, k, {value: 1}); return a[k] == 1; })"),
+      njs_str("true") },
+
+    { njs_str("var a = Buffer.from([1]);"
+              "Object.defineProperty(a, 'x', {enumerable: true,"
+              "  get() { return this === a && this[0]; }});"
+              "Object.values(a)"),
+      njs_str("1,1") },
 
     { njs_str(NJS_INT_TYPED_ARRAY_LIST
               ".map(v=>{try { var a = new v(1); $262.detachArrayBuffer(a.buffer); Object.entries(a)} "
@@ -9885,6 +10160,22 @@ static njs_unit_test_t  njs_test[] =
               "r[Symbol.replace]('ABCD', 'b')"),
       njs_str("b") },
 
+    { njs_str("var r = /./; r.exec = () => globalThis;"
+              "r[Symbol.replace]('', '') === ''"),
+      njs_str("true") },
+
+    { njs_str("var exec = RegExp.prototype.exec, saved;"
+              "var r = /a/; r.exec = function(s) {"
+              "  saved = exec.call(this, s); return saved; };"
+              "r[Symbol.replace]('a', 'b'); saved[0]"),
+      njs_str("a") },
+
+    { njs_str("var exec = RegExp.prototype.exec, saved;"
+              "RegExp.prototype.exec = function(s) {"
+              "  saved = exec.call(this, s); return saved; };"
+              "'a'.split(/a/); saved[0]"),
+      njs_str("a") },
+
     { njs_str("'α'.replace(/(h*)/g, '$1βγ')"),
       njs_str("βγαβγ") },
 
@@ -9973,6 +10264,14 @@ static njs_unit_test_t  njs_test[] =
 
     { njs_str("'ABC'.replace(/(?<b>B)/, '|$<BB$$|>@')"),
       njs_str("A|@C") },
+
+    { njs_str("var s = '(?:' + '()'.repeat(127) + '){0}(?<x>a)';"
+              "new RegExp(s).exec('a').groups.x"),
+      njs_str("a") },
+
+    { njs_str("var s = '(?:' + '()'.repeat(383) + '){0}(?<x>a)';"
+              "new RegExp(s).exec('a').groups.x"),
+      njs_str("a") },
 
     { njs_str("'ABCB'.replaceAll(/(?<b>B)/g, '|$<BB$$|>@')"),
       njs_str("A|@C|@") },
@@ -10137,6 +10436,57 @@ static njs_unit_test_t  njs_test[] =
               "re.exec = () => {if (cnt++ > 1) return null; return a};"
               "'abc'.replaceAll(re, '@$1|$2|$3|$4|$99|$100|@')"),
       njs_str("@|X||Y|Z|0|@") },
+
+    { njs_str("var n = 0, s = 'αβγ';"
+              "var re = {global: false, flags: '', exec: () =>"
+              "  n++ ? null : {0: 'y'.repeat(100), index: 0}};"
+              "RegExp.prototype[Symbol.replace].call(re, s, \"[$']\")"),
+      njs_str("[]") },
+
+    { njs_str("var n = 0, s = 'αβγδε';"
+              "var re = {global: false, flags: '', exec: () =>"
+              "  n++ ? null : {0: 'y'.repeat(1000), index: 2}};"
+              "RegExp.prototype[Symbol.replace].call(re, s, \"<$'>\")"),
+      njs_str("αβ<>") },
+
+    { njs_str("var n = 0, s = 'αβγ';"
+              "var re = {global: false, flags: '', exec: () =>"
+              "  n++ ? null : {0: 'y', index: 0}};"
+              "RegExp.prototype[Symbol.replace].call(re, s, '')"),
+      njs_str("βγ") },
+
+    { njs_str("var n = 0, s = 'αβγ';"
+              "var re = {global: false, flags: '', exec: () =>"
+              "  n++ ? null : {0: 'y', index: 1e9}};"
+              "RegExp.prototype[Symbol.replace].call(re, s, '[$`]')"),
+      njs_str("αβγ[αβγ]") },
+
+    { njs_str("var n = 0, s = 'αβγδ';"
+              "var re = {global: false, flags: '', exec: () =>"
+              "  n++ ? null : {0: 'αβ', index: 1}};"
+              "RegExp.prototype[Symbol.replace].call(re, s, \"[$&|$`|$']\")"),
+      njs_str("α[αβ|α|δ]δ") },
+
+    { njs_str("var n = 0, s = 'αβγδεζ';"
+              "var a = [{0: 'y', index: 5}, {0: 'y', index: 0}];"
+              "var re = {global: true, flags: 'g',"
+              "          exec: () => n < a.length ? a[n++] : null};"
+              "RegExp.prototype[Symbol.replace].call(re, s, '<$&>')"),
+      njs_str("αβγδε<y>") },
+
+    { njs_str("var n = 0;"
+              "var a = [{0: 'yyyy', index: 0}, {0: 'z', index: 3}];"
+              "var re = {global: true, flags: 'g',"
+              "          exec: () => n < a.length ? a[n++] : null};"
+              "RegExp.prototype[Symbol.replace].call(re, 'abc', '[1]')"),
+      njs_str("[1]") },
+
+    { njs_str("var n = 0;"
+              "var re = {global: false, flags: '', exec: () =>"
+              "  n++ ? null : {0: 'yyyyyyyyy', index: 1}};"
+              "RegExp.prototype[Symbol.replace].call(re, 'abcdef',"
+              "                                      \"[$&|$`|$']\")"),
+      njs_str("a[yyyyyyyyy|a|]") },
 
     { njs_str("var a = [];"
               "Object.defineProperty(a, 32768, {});"
@@ -14083,6 +14433,15 @@ static njs_unit_test_t  njs_test[] =
     { njs_str("false.__proto__ === Boolean.prototype"),
       njs_str("true") },
 
+    { njs_str("var o = {valueOf() { o = 0; return {}; },"
+              "         toString() { return '7'; }}; +o"),
+      njs_str("7") },
+
+    { njs_str("var original = {toString() { return '7'; }}, o = original;"
+              "Object.defineProperty(original, 'valueOf', {get() {"
+              "  o = 0; return () => ({}); }}); +o"),
+      njs_str("7") },
+
     { njs_str("var b = Boolean(1); b.__proto__ === Boolean.prototype"),
       njs_str("true") },
 
@@ -15062,6 +15421,11 @@ static njs_unit_test_t  njs_test[] =
               "sum(2, 4);"),
       njs_str("6") },
 
+    { njs_str("(new Function('a',"
+              " 'return function(b) { return function(c) {"
+              " return a + b + c; }; };'))(1)(2)(3)"),
+      njs_str("6") },
+
     { njs_str("var sum = new Function('a, b', 'c', 'return a + b + c');"
               "sum(2, 4, 4);"),
       njs_str("10") },
@@ -15736,6 +16100,18 @@ static njs_unit_test_t  njs_test[] =
               "f(f);"
               "njs.dump(arr)"),
       njs_str("[1,'[Getter]']") },
+
+    { njs_str("var a = [1], n = 0;"
+              "Object.defineProperty(a, 0, {"
+              "  get get() { n++; a.unshift(0); return function() {}; }});"
+              "n"),
+      njs_str("1") },
+
+    { njs_str("var a = [1], n = 0;"
+              "Object.defineProperty(a, 'length', {"
+              "  get writable() { n++; return false; }});"
+              "n"),
+      njs_str("1") },
 
     { njs_str("Object.defineProperties()"),
       njs_str("TypeError: Object.defineProperties is called on non-object") },
@@ -20512,6 +20888,49 @@ static njs_unit_test_t  njs_test[] =
               "} res"),
       njs_str("0,0,0,0,0") },
 
+    /*
+     * A declaration nested in a declarator initializer must not change the
+     * kind of the declarators that follow it.
+     */
+
+    { njs_str("let out = [];"
+              "for (let a = function() { var z; }, b = 0; b < 2; b++) {"
+              "    out.push(() => b);"
+              "} out[0]() + ',' + out[1]()"),
+      njs_str("0,1") },
+
+    { njs_str("let out = [];"
+              "for (let a = 1, b = function() { var z; }, c = 0; c < 2; c++) {"
+              "    out.push(() => c);"
+              "} out[0]() + ',' + out[1]()"),
+      njs_str("0,1") },
+
+    { njs_str("let out = [];"
+              "for (var a = function() { let z; }, b = 0; b < 2; b++) {"
+              "    out.push(() => b);"
+              "} out[0]() + ',' + out[1]()"),
+      njs_str("2,2") },
+
+    { njs_str("var r;"
+              "for (const a = function() { var z; }, b = 2; b > 0;) {"
+              "    try { b = 3 } catch (e) { r = e.name } break"
+              "} r"),
+      njs_str("TypeError") },
+
+    /* The same state serves an ordinary declaration list. */
+
+    { njs_str("var r;"
+              "const a = function() { var z; }, b = 2;"
+              "try { b = 3 } catch (e) { r = e.name } r"),
+      njs_str("TypeError") },
+
+    { njs_str("let a = function() { var z; }, b = 0;"
+              "for (; b < 2; b++) {} b"),
+      njs_str("2") },
+
+    { njs_str("let a = function() { var ; }, b = 0;"),
+      njs_str("SyntaxError: Unexpected token \";\"") },
+
     { njs_str("let arr = [], res = [];"
               "for (let i = 0; arr.push(() => i), i < 10; i++) {}"
               "for (let k = 0; k < 10; k++) {res.push(arr[k]())}"
@@ -21704,6 +22123,16 @@ static njs_unit_test_t  njs_externals_test[] =
       njs_str("X:4") },
 
     { njs_str("async function f() {"
+              "    var r = [];"
+              "    for (var k in await Promise.resolve({a:1, b:2})) {"
+              "        r.push(k);"
+              "    }"
+              "    return r.join(':');"
+              "}"
+              "f().then($r.retval)"),
+      njs_str("a:b") },
+
+    { njs_str("async function f() {"
               "    return ((...a) => a[1] + ':' + a[2] + ':' + a[0].length)"
               "           `a${await Promise.resolve(2)}b"
               "${await Promise.resolve(3)}c`;"
@@ -22049,6 +22478,10 @@ static njs_unit_test_t  njs_tz_test[] =
      { njs_str("var d = new Date(1308895323625); d.setMonth(2, 10);"
                   "d.getTime()"),
        njs_str("1299733323625") },
+
+     { njs_str("var d = new Date(Date.UTC(2016, 6)); d.setUTCMonth(6, 6);"
+                  "d.getTime()"),
+       njs_str("1467763200000") },
 
      { njs_str("var d = new Date(1308895323625); d.setMonth(2);"
                   "d.getTime()"),
@@ -23664,6 +24097,25 @@ njs_chb_test(njs_vm_t *vm, njs_opts_t *opts, njs_stat_t *stat)
         ret = NJS_ERROR;
         njs_printf("njs_chb_sprintf() corrupts \"%V\" != \"%V\"\n", &string,
                    &expected);
+        goto done;
+    }
+
+    njs_mp_free(njs_vm_memory_pool(vm), string.start);
+
+    njs_chb_destroy(&chain);
+    NJS_CHB_MP_INIT(&chain, njs_vm_memory_pool(vm));
+
+    njs_chb_sprintf(&chain, 32, "%2f", 123.45);
+
+    ret = njs_chb_join(&chain, &string);
+    if (ret != NJS_OK) {
+        njs_printf("njs_chb_join() failed\n");
+        goto done;
+    }
+
+    if (!njs_strstr_eq(&string, &(njs_str_t) njs_str("123.45"))) {
+        ret = NJS_ERROR;
+        njs_printf("njs_chb_sprintf() corrupts float \"%V\"\n", &string);
         goto done;
     }
 
