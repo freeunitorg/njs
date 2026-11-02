@@ -26,6 +26,20 @@ njs_chb_init(njs_chb_t *chain, void *pool, njs_chb_alloc_t alloc,
 }
 
 
+void *
+njs_chb_mp_alloc(void *pool, size_t size)
+{
+    return njs_mp_alloc(pool, size);
+}
+
+
+void
+njs_chb_mp_free(void *pool, void *p)
+{
+    njs_mp_free(pool, p);
+}
+
+
 void
 njs_chb_append0(njs_chb_t *chain, const char *msg, size_t len)
 {
@@ -54,7 +68,8 @@ njs_chb_reserve(njs_chb_t *chain, size_t size)
     }
 
     if (njs_slow_path(chain->max_size != 0
-                      && chain->total_size + size > chain->max_size))
+                      && (chain->total_size > chain->max_size
+                          || size > chain->max_size - chain->total_size)))
     {
         chain->error = NJS_CHB_ERR_OVERFLOW;
         return NULL;

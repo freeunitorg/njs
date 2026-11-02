@@ -11,8 +11,8 @@
 
 #include <njs_auto_config.h>
 
-#define NJS_VERSION                 "1.0.1"
-#define NJS_VERSION_NUMBER          0x010001
+#define NJS_VERSION                 "1.0.2"
+#define NJS_VERSION_NUMBER          0x010002
 
 
 #include <string.h>
@@ -44,8 +44,9 @@ typedef struct njs_external_s         njs_external_t;
  * sizeof(njs_opaque_value_t) == sizeof(njs_value_t).
  */
 
-typedef struct {
+typedef union {
     uint32_t                        filler[4];
+    uint64_t                        align;
 } njs_opaque_value_t;
 
 /* sizeof(njs_value_t) is 16 bytes. */
@@ -488,6 +489,7 @@ NJS_EXPORT void njs_value_external_set(njs_value_t *value,
 
 NJS_EXPORT uint8_t njs_value_bool(const njs_value_t *value);
 NJS_EXPORT double njs_value_number(const njs_value_t *value);
+NJS_EXPORT uint64_t njs_number_to_length(double num);
 NJS_EXPORT njs_function_t *njs_value_function(const njs_value_t *value);
 NJS_EXPORT njs_function_native_t njs_value_native_function(
     const njs_value_t *value);

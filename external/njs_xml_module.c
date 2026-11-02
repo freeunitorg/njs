@@ -13,12 +13,6 @@
 #include <libxml/xpathInternals.h>
 
 
-typedef struct {
-    xmlDoc         *doc;
-    xmlParserCtxt  *ctx;
-} njs_xml_doc_t;
-
-
 typedef enum {
     XML_NSET_TREE = 0,
     XML_NSET_TREE_NO_COMMENTS,
@@ -57,6 +51,12 @@ static njs_int_t njs_xml_attr_ext_prop_handler(njs_vm_t *vm,
     njs_value_t *unused, njs_value_t *retval);
 static njs_int_t njs_xml_node_ext_add_child(njs_vm_t *vm, njs_value_t *args,
     njs_uint_t nargs, njs_index_t unused, njs_value_t *retval);
+static njs_int_t njs_xml_node_ext_get_attribute_ns(njs_vm_t *vm,
+    njs_value_t *args, njs_uint_t nargs, njs_index_t unused,
+    njs_value_t *retval);
+static njs_int_t njs_xml_node_ext_get_child_ns(njs_vm_t *vm,
+    njs_value_t *args, njs_uint_t nargs, njs_index_t unused,
+    njs_value_t *retval);
 static njs_int_t njs_xml_node_ext_attrs(njs_vm_t *vm, njs_object_prop_t *prop,
     uint32_t unused, njs_value_t *value, njs_value_t *setval,
     njs_value_t *retval);
@@ -102,16 +102,22 @@ static njs_int_t njs_xml_node_tag_handler(njs_vm_t *vm, njs_value_t *value,
     njs_str_t *name, njs_value_t *setval, njs_value_t *retval);
 static njs_int_t njs_xml_node_tags_handler(njs_vm_t *vm, njs_value_t *value,
     njs_str_t *name, njs_value_t *setval, njs_value_t *retval);
+static njs_int_t njs_xml_attr_value(njs_vm_t *vm, xmlAttr *attr,
+    njs_value_t *retval);
 
 static xmlNode *njs_xml_external_node(njs_vm_t *vm, njs_value_t *value);
-static njs_int_t njs_xml_str_to_c_string(njs_vm_t *vm, njs_str_t *str,
+static const u_char *njs_xml_string_to_c_string(njs_vm_t *vm, njs_str_t *str,
     u_char *dst, size_t size);
-static const u_char *njs_xml_value_to_c_string(njs_vm_t *vm, njs_value_t *value,
-    u_char *dst, size_t size);
-static njs_int_t njs_xml_encode_special_chars(njs_vm_t *vm, njs_str_t *src,
-    njs_str_t *out);
-static njs_int_t njs_xml_replace_node(njs_vm_t *vm, njs_value_t *value,
-    xmlNode *current);
+static xmlNode *njs_xml_ns_args(njs_vm_t *vm, njs_value_t *args,
+    njs_uint_t nargs, njs_str_t *uri, njs_str_t *local);
+static njs_bool_t njs_xml_ns_match(const xmlChar *name, xmlNs *ns,
+    njs_str_t *uri, njs_str_t *local);
+static njs_bool_t njs_xml_node_is_live(xmlNode *node);
+static xmlNode *njs_xml_list_detach(xmlNode *parent, njs_str_t *name);
+static njs_int_t njs_xml_list_retire(njs_vm_t *vm, xmlNode *parent,
+    njs_str_t *name);
+static void njs_xml_list_append(xmlNode *parent, xmlNode *node);
+static njs_bool_t njs_xml_tree_has_namespaces(xmlNode *node);
 static void njs_xml_node_cleanup(void *data);
 static void njs_xml_doc_cleanup(void *data);
 
@@ -120,7 +126,7 @@ static njs_xml_nset_t *njs_xml_nset_create(njs_vm_t *vm, xmlDoc *doc,
 static njs_xml_nset_t *njs_xml_nset_add(njs_xml_nset_t *nset,
     njs_xml_nset_t *add);
 static void njs_xml_nset_cleanup(void *data);
-static void njs_xml_error(njs_vm_t *vm, njs_xml_doc_t *tree, const char *fmt,
+static void njs_xml_error(njs_vm_t *vm, xmlParserCtxt *ctx, const char *fmt,
     ...);
 static njs_int_t njs_xml_init(njs_vm_t *vm);
 
@@ -256,6 +262,28 @@ static njs_external_t  njs_ext_xml_node[] = {
         .enumerable = 1,
         .u.method = {
             .native = njs_xml_node_ext_add_child,
+        }
+    },
+
+    {
+        .flags = NJS_EXTERN_METHOD,
+        .name.string = njs_str("getAttributeNS"),
+        .writable = 1,
+        .configurable = 1,
+        .enumerable = 1,
+        .u.method = {
+            .native = njs_xml_node_ext_get_attribute_ns,
+        }
+    },
+
+    {
+        .flags = NJS_EXTERN_METHOD,
+        .name.string = njs_str("getChildNS"),
+        .writable = 1,
+        .configurable = 1,
+        .enumerable = 1,
+        .u.method = {
+            .native = njs_xml_node_ext_get_child_ns,
         }
     },
 
@@ -424,9 +452,10 @@ static njs_int_t
 njs_xml_ext_parse(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
     njs_index_t unused, njs_value_t *retval)
 {
+    xmlDoc            *doc;
     njs_int_t         ret;
     njs_str_t         data;
-    njs_xml_doc_t     *tree;
+    xmlParserCtxt     *ctx;
     njs_mp_cleanup_t  *cln;
 
     ret = njs_vm_value_to_bytes(vm, &data, njs_arg(args, nargs, 1));
@@ -434,50 +463,51 @@ njs_xml_ext_parse(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
         return NJS_ERROR;
     }
 
-    tree = njs_mp_zalloc(njs_vm_memory_pool(vm), sizeof(njs_xml_doc_t));
-    if (njs_slow_path(tree == NULL)) {
-        njs_vm_memory_error(vm);
-        return NJS_ERROR;
-    }
-
-    tree->ctx = xmlNewParserCtxt();
-    if (njs_slow_path(tree->ctx == NULL)) {
+    ctx = xmlNewParserCtxt();
+    if (njs_slow_path(ctx == NULL)) {
         njs_vm_internal_error(vm, "xmlNewParserCtxt() failed");
         return NJS_ERROR;
     }
 
-    tree->doc = xmlCtxtReadMemory(tree->ctx, (char *) data.start, data.length,
-                                  NULL, NULL, XML_PARSE_NOWARNING
-                                              | XML_PARSE_NOERROR);
-    if (njs_slow_path(tree->doc == NULL)) {
-        njs_xml_error(vm, tree, "failed to parse XML");
-        return NJS_ERROR;
+    doc = xmlCtxtReadMemory(ctx, (char *) data.start, data.length, NULL, NULL,
+                            XML_PARSE_NOWARNING | XML_PARSE_NOERROR);
+    if (njs_slow_path(doc == NULL)) {
+        njs_xml_error(vm, ctx, "failed to parse XML");
+        goto failed;
     }
+
+    xmlFreeParserCtxt(ctx);
 
     cln = njs_mp_cleanup_add(njs_vm_memory_pool(vm), 0);
     if (njs_slow_path(cln == NULL)) {
         njs_vm_memory_error(vm);
+        xmlFreeDoc(doc);
         return NJS_ERROR;
     }
 
     cln->handler = njs_xml_doc_cleanup;
-    cln->data = tree;
+    cln->data = doc;
 
-    return njs_vm_external_create(vm, retval, njs_xml_doc_proto_id,
-                                  tree, 0);
+    return njs_vm_external_create(vm, retval, njs_xml_doc_proto_id, doc, 0);
+
+failed:
+
+    xmlFreeParserCtxt(ctx);
+
+    return NJS_ERROR;
 }
 
 
 static njs_int_t
 njs_xml_doc_ext_prop_keys(njs_vm_t *vm, njs_value_t *value, njs_value_t *keys)
 {
-    xmlNode        *node;
-    njs_int_t      ret;
-    njs_value_t    *push;
-    njs_xml_doc_t  *tree;
+    xmlDoc       *doc;
+    xmlNode      *node;
+    njs_int_t    ret;
+    njs_value_t  *push;
 
-    tree = njs_vm_external(vm, njs_xml_doc_proto_id, value);
-    if (njs_slow_path(tree == NULL)) {
+    doc = njs_vm_external(vm, njs_xml_doc_proto_id, value);
+    if (njs_slow_path(doc == NULL)) {
         njs_value_undefined_set(keys);
         return NJS_DECLINED;
     }
@@ -487,7 +517,7 @@ njs_xml_doc_ext_prop_keys(njs_vm_t *vm, njs_value_t *value, njs_value_t *keys)
         return NJS_ERROR;
     }
 
-    for (node = xmlDocGetRootElement(tree->doc);
+    for (node = xmlDocGetRootElement(doc);
          node != NULL;
          node = node->next)
     {
@@ -515,14 +545,14 @@ static njs_int_t
 njs_xml_doc_ext_root(njs_vm_t *vm, njs_object_prop_t *prop, uint32_t atom_id,
      njs_value_t *value, njs_value_t *unused, njs_value_t *retval)
 {
-    xmlNode        *node;
-    njs_int_t      ret;
-    njs_str_t      name;
-    njs_bool_t     any;
-    njs_xml_doc_t  *tree;
+    xmlDoc      *doc;
+    xmlNode     *node;
+    njs_int_t   ret;
+    njs_str_t   name;
+    njs_bool_t  any;
 
-    tree = njs_vm_external(vm, njs_xml_doc_proto_id, value);
-    if (njs_slow_path(tree == NULL)) {
+    doc = njs_vm_external(vm, njs_xml_doc_proto_id, value);
+    if (njs_slow_path(doc == NULL)) {
         njs_value_undefined_set(retval);
         return NJS_DECLINED;
     }
@@ -542,7 +572,7 @@ njs_xml_doc_ext_root(njs_vm_t *vm, njs_object_prop_t *prop, uint32_t atom_id,
         name.start = NULL;
     }
 
-    for (node = xmlDocGetRootElement(tree->doc);
+    for (node = xmlDocGetRootElement(doc);
          node != NULL;
          node = node->next)
     {
@@ -727,11 +757,10 @@ static njs_int_t
 njs_xml_node_ext_add_child(njs_vm_t *vm, njs_value_t *args,
     njs_uint_t nargs, njs_index_t unused, njs_value_t *retval)
 {
-    xmlNode    *current, *node, *copy, *rnode;
-    njs_int_t  ret;
+    xmlNode  *current, *node;
 
     current = njs_vm_external(vm, njs_xml_node_proto_id, njs_argument(args, 0));
-    if (njs_slow_path(current == NULL)) {
+    if (njs_slow_path(!njs_xml_node_is_live(current))) {
         njs_vm_type_error(vm, "\"this\" is not a XMLNode object");
         return NJS_ERROR;
     }
@@ -742,40 +771,87 @@ njs_xml_node_ext_add_child(njs_vm_t *vm, njs_value_t *args,
         return NJS_ERROR;
     }
 
-    copy = xmlDocCopyNode(current, current->doc, 1);
-    if (njs_slow_path(copy == NULL)) {
-        njs_vm_internal_error(vm, "xmlDocCopyNode() failed");
+    if (njs_slow_path(njs_xml_tree_has_namespaces(node))) {
+        njs_vm_type_error(vm, "XMLNode has namespaces");
         return NJS_ERROR;
     }
 
     node = xmlDocCopyNode(node, current->doc, 1);
     if (njs_slow_path(node == NULL)) {
         njs_vm_internal_error(vm, "xmlDocCopyNode() failed");
-        goto error;
+        return NJS_ERROR;
     }
 
-    rnode = xmlAddChild(copy, node);
-    if (njs_slow_path(rnode == NULL)) {
-        xmlFreeNode(node);
-        njs_vm_internal_error(vm, "xmlAddChild() failed");
-        goto error;
+    njs_xml_list_append(current, node);
+
+    njs_value_undefined_set(retval);
+
+    return NJS_OK;
+}
+
+
+static njs_int_t
+njs_xml_node_ext_get_attribute_ns(njs_vm_t *vm, njs_value_t *args,
+    njs_uint_t nargs, njs_index_t unused, njs_value_t *retval)
+{
+    xmlAttr    *attr;
+    xmlChar    *text;
+    xmlNode    *current;
+    njs_int_t  ret;
+    njs_str_t  uri, local;
+
+    current = njs_xml_ns_args(vm, args, nargs, &uri, &local);
+    if (njs_slow_path(current == NULL)) {
+        return NJS_ERROR;
     }
 
-    ret = xmlReconciliateNs(current->doc, copy);
-    if (njs_slow_path(ret == -1)) {
-        njs_vm_internal_error(vm, "xmlReconciliateNs() failed");
-        goto error;
+    for (attr = current->properties; attr != NULL; attr = attr->next) {
+        if (!njs_xml_ns_match(attr->name, attr->ns, &uri, &local)) {
+            continue;
+        }
+
+        text = xmlNodeGetContent((xmlNode *) attr);
+        if (njs_slow_path(text == NULL)) {
+            njs_vm_internal_error(vm, "xmlNodeGetContent() failed");
+            return NJS_ERROR;
+        }
+
+        ret = njs_vm_value_string_create(vm, retval, text, njs_strlen(text));
+        xmlFree(text);
+
+        return ret;
     }
 
     njs_value_undefined_set(retval);
 
-    return njs_xml_replace_node(vm, njs_argument(args, 0), copy);
+    return NJS_OK;
+}
 
-error:
 
-    xmlFreeNode(copy);
+static njs_int_t
+njs_xml_node_ext_get_child_ns(njs_vm_t *vm, njs_value_t *args,
+    njs_uint_t nargs, njs_index_t unused, njs_value_t *retval)
+{
+    xmlNode    *current, *node;
+    njs_str_t  uri, local;
 
-    return NJS_ERROR;
+    current = njs_xml_ns_args(vm, args, nargs, &uri, &local);
+    if (njs_slow_path(current == NULL)) {
+        return NJS_ERROR;
+    }
+
+    for (node = current->children; node != NULL; node = node->next) {
+        if (node->type == XML_ELEMENT_NODE
+            && njs_xml_ns_match(node->name, node->ns, &uri, &local))
+        {
+            return njs_vm_external_create(vm, retval, njs_xml_node_proto_id,
+                                          node, 0);
+        }
+    }
+
+    njs_value_undefined_set(retval);
+
+    return NJS_OK;
 }
 
 
@@ -866,7 +942,7 @@ njs_xml_node_ext_remove_all_attributes(njs_vm_t *vm,
     xmlNode  *current;
 
     current = njs_vm_external(vm, njs_xml_node_proto_id, njs_argument(args, 0));
-    if (njs_slow_path(current == NULL)) {
+    if (njs_slow_path(!njs_xml_node_is_live(current))) {
         njs_vm_type_error(vm, "\"this\" is not a XMLNode object");
         return NJS_ERROR;
     }
@@ -886,12 +962,12 @@ static njs_int_t
 njs_xml_node_ext_remove_children(njs_vm_t *vm, njs_value_t *args,
     njs_uint_t nargs, njs_index_t unused, njs_value_t *retval)
 {
-    xmlNode      *current, *copy;
+    xmlNode      *current;
     njs_str_t    name;
     njs_value_t  *selector;
 
     current = njs_vm_external(vm, njs_xml_node_proto_id, njs_argument(args, 0));
-    if (njs_slow_path(current == NULL)) {
+    if (njs_slow_path(!njs_xml_node_is_live(current))) {
         njs_vm_type_error(vm, "\"this\" is not a XMLNode object");
         return NJS_ERROR;
     }
@@ -913,18 +989,11 @@ njs_xml_node_ext_remove_children(njs_vm_t *vm, njs_value_t *args,
 
     /* all. */
 
-    copy = xmlDocCopyNode(current, current->doc, 1);
-    if (njs_slow_path(copy == NULL)) {
-        njs_vm_internal_error(vm, "xmlDocCopyNode() failed");
-        return NJS_ERROR;
+    if (current->children == NULL) {
+        return NJS_OK;
     }
 
-    if (copy->children != NULL) {
-        xmlFreeNodeList(copy->children);
-        copy->children = NULL;
-    }
-
-    return njs_xml_replace_node(vm, njs_argument(args, 0), copy);
+    return njs_xml_list_retire(vm, current, NULL);
 }
 
 
@@ -981,7 +1050,12 @@ njs_xml_node_ext_tags(njs_vm_t *vm, njs_object_prop_t *prop, uint32_t unused,
     njs_str_t  name;
 
     current = njs_vm_external(vm, njs_xml_node_proto_id, value);
-    if (njs_slow_path(current == NULL || current->children == NULL)) {
+    if (njs_slow_path(current == NULL)) {
+        njs_value_undefined_set(retval);
+        return NJS_DECLINED;
+    }
+
+    if (retval != NULL && current->children == NULL && setval == NULL) {
         njs_value_undefined_set(retval);
         return NJS_DECLINED;
     }
@@ -997,10 +1071,9 @@ static njs_int_t
 njs_xml_node_ext_text(njs_vm_t *vm, njs_object_prop_t *unused, uint32_t unused1,
     njs_value_t *value, njs_value_t *setval, njs_value_t *retval)
 {
-    u_char     *text;
-    xmlNode    *current, *copy;
+    xmlNode    *current, *text;
     njs_int_t  ret;
-    njs_str_t  content, enc;
+    njs_str_t  content;
 
     current = njs_vm_external(vm, njs_xml_node_proto_id, value);
     if (njs_slow_path(current == NULL)) {
@@ -1009,18 +1082,29 @@ njs_xml_node_ext_text(njs_vm_t *vm, njs_object_prop_t *unused, uint32_t unused1,
     }
 
     if (retval != NULL && setval == NULL) {
-        text = xmlNodeGetContent(current);
-        ret = njs_vm_value_string_create(vm, retval, text, njs_strlen(text));
+        content.start = xmlNodeGetContent(current);
+        if (njs_slow_path(content.start == NULL)) {
+            njs_vm_memory_error(vm);
+            return NJS_ERROR;
+        }
 
-        xmlFree(text);
+        ret = njs_vm_value_string_create(vm, retval, content.start,
+                                         njs_strlen(content.start));
+
+        xmlFree(content.start);
 
         return ret;
     }
 
+    if (njs_slow_path(!njs_xml_node_is_live(current))) {
+        njs_vm_type_error(vm, "XMLNode is detached");
+        return NJS_ERROR;
+    }
+
     /* set or delete. */
 
-    enc.start = NULL;
-    enc.length = 0;
+    content.start = NULL;
+    content.length = 0;
 
     if (retval != NULL
         && (setval != NULL && !njs_value_is_null_or_undefined(setval)))
@@ -1032,25 +1116,38 @@ njs_xml_node_ext_text(njs_vm_t *vm, njs_object_prop_t *unused, uint32_t unused1,
 
         njs_value_string_get(vm, setval, &content);
 
-        ret = njs_xml_encode_special_chars(vm, &content, &enc);
-        if (njs_slow_path(ret != NJS_OK)) {
+        if (njs_slow_path(memchr(content.start, '\0', content.length) != NULL)) {
+            njs_vm_type_error(vm, "setval contains NUL");
             return NJS_ERROR;
         }
     }
 
-    copy = xmlDocCopyNode(current, current->doc, 1);
-    if (njs_slow_path(copy == NULL)) {
-        njs_vm_internal_error(vm, "xmlDocCopyNode() failed");
-        return NJS_ERROR;
+    text = NULL;
+
+    if (retval != NULL && setval != NULL) {
+        text = xmlNewDocTextLen(current->doc, content.start, content.length);
+        if (njs_slow_path(text == NULL)) {
+            njs_vm_internal_error(vm, "xmlNewDocTextLen() failed");
+            return NJS_ERROR;
+        }
     }
 
-    xmlNodeSetContentLen(copy, enc.start, enc.length);
+    if (current->children != NULL) {
+        if (njs_slow_path(njs_xml_list_retire(vm, current, NULL) != NJS_OK)) {
+            xmlFreeNode(text);
+            return NJS_ERROR;
+        }
+    }
+
+    if (text != NULL) {
+        njs_xml_list_append(current, text);
+    }
 
     if (retval != NULL) {
         njs_value_undefined_set(retval);
     }
 
-    return njs_xml_replace_node(vm, value, copy);
+    return NJS_OK;
 }
 
 
@@ -1060,8 +1157,9 @@ njs_xml_node_attr_handler(njs_vm_t *vm, xmlNode *current, njs_str_t *name,
 {
     size_t        size;
     njs_int_t     ret;
+    njs_str_t     str;
     xmlAttr       *attr;
-    const u_char  *content, *value;
+    const u_char  *name_c, *value;
     u_char        name_buf[512], value_buf[1024];
 
     if (retval != NULL && setval == NULL) {
@@ -1080,15 +1178,7 @@ njs_xml_node_attr_handler(njs_vm_t *vm, xmlNode *current, njs_str_t *name,
                 continue;
             }
 
-            if (attr->children != NULL
-                && attr->children->next == NULL
-                && attr->children->type == XML_TEXT_NODE)
-            {
-                content = (const u_char *) attr->children->content;
-
-                return njs_vm_value_string_create(vm, retval, content,
-                                                  njs_strlen(content));
-            }
+            return njs_xml_attr_value(vm, attr, retval);
         }
 
         njs_value_undefined_set(retval);
@@ -1098,12 +1188,18 @@ njs_xml_node_attr_handler(njs_vm_t *vm, xmlNode *current, njs_str_t *name,
 
     /* set or delete. */
 
-    ret = njs_xml_str_to_c_string(vm, name, &name_buf[0], sizeof(name_buf));
-    if (njs_slow_path(ret != NJS_OK)) {
+    if (njs_slow_path(!njs_xml_node_is_live(current))) {
+        njs_vm_type_error(vm, "XMLNode is detached");
         return NJS_ERROR;
     }
 
-    ret = xmlValidateQName(&name_buf[0], 0);
+    name_c = njs_xml_string_to_c_string(vm, name, &name_buf[0],
+                                        sizeof(name_buf));
+    if (njs_slow_path(name_c == NULL)) {
+        return NJS_ERROR;
+    }
+
+    ret = xmlValidateQName(name_c, 0);
     if (njs_slow_path(ret != 0)) {
         njs_vm_type_error(vm, "attribute name \"%V\" is not valid", name);
         return NJS_ERROR;
@@ -1114,7 +1210,7 @@ njs_xml_node_attr_handler(njs_vm_t *vm, xmlNode *current, njs_str_t *name,
     {
         /* delete. */
 
-        attr = xmlHasProp(current, &name_buf[0]);
+        attr = xmlHasProp(current, name_c);
 
         if (attr != NULL) {
             xmlRemoveProp(attr);
@@ -1123,13 +1219,20 @@ njs_xml_node_attr_handler(njs_vm_t *vm, xmlNode *current, njs_str_t *name,
         return NJS_OK;
     }
 
-    value = njs_xml_value_to_c_string(vm, setval, &value_buf[0],
-                                      sizeof(value_buf));
+    if (njs_slow_path(!njs_value_is_string(setval))) {
+        njs_vm_type_error(vm, "setval is not a string");
+        return NJS_ERROR;
+    }
+
+    njs_value_string_get(vm, setval, &str);
+
+    value = njs_xml_string_to_c_string(vm, &str, &value_buf[0],
+                                       sizeof(value_buf));
     if (njs_slow_path(value == NULL)) {
         return NJS_ERROR;
     }
 
-    attr = xmlSetProp(current, &name_buf[0], value);
+    attr = xmlSetProp(current, name_c, value);
     if (njs_slow_path(attr == NULL)) {
         njs_vm_internal_error(vm, "xmlSetProp() failed");
         return NJS_ERROR;
@@ -1142,39 +1245,50 @@ njs_xml_node_attr_handler(njs_vm_t *vm, xmlNode *current, njs_str_t *name,
 
 
 static njs_int_t
-njs_xml_node_tag_remove(njs_vm_t *vm, njs_value_t *value, njs_str_t *name)
+njs_xml_attr_value(njs_vm_t *vm, xmlAttr *attr, njs_value_t *retval)
 {
-    size_t     size;
-    xmlNode    *current, *node, *next, *copy;
+    njs_int_t  ret;
+    xmlChar    *text;
 
-    current = njs_vm_external(vm, njs_xml_node_proto_id, value);
-
-    copy = xmlDocCopyNode(current, current->doc, 1);
-    if (njs_slow_path(copy == NULL)) {
-        njs_vm_internal_error(vm, "xmlDocCopyNode() failed");
+    text = xmlNodeGetContent((xmlNode *) attr);
+    if (njs_slow_path(text == NULL)) {
+        njs_vm_internal_error(vm, "xmlNodeGetContent() failed");
         return NJS_ERROR;
     }
 
-    for (node = copy->children; node != NULL; node = next) {
-        next = node->next;
+    ret = njs_vm_value_string_create(vm, retval, text, njs_strlen(text));
+    xmlFree(text);
 
-        if (node->type != XML_ELEMENT_NODE) {
-            continue;
-        }
+    return ret;
+}
 
-        size = njs_strlen(node->name);
 
-        if (name->length != size
-            || njs_strncmp(name->start, node->name, size) != 0)
-        {
-            continue;
-        }
+static njs_int_t
+njs_xml_node_tag_remove(njs_vm_t *vm, njs_value_t *value, njs_str_t *name)
+{
+    xmlNode  *current, *node;
 
-        xmlUnlinkNode(node);
-        xmlFreeNode(node);
+    current = njs_vm_external(vm, njs_xml_node_proto_id, value);
+
+    if (njs_slow_path(!njs_xml_node_is_live(current))) {
+        njs_vm_type_error(vm, "XMLNode is detached");
+        return NJS_ERROR;
     }
 
-    return njs_xml_replace_node(vm, value, copy);
+    for (node = current->children; node != NULL; node = node->next) {
+        if (node->type == XML_ELEMENT_NODE
+            && name->length == njs_strlen(node->name)
+            && njs_strncmp(name->start, node->name, name->length) == 0)
+        {
+            break;
+        }
+    }
+
+    if (node == NULL) {
+        return NJS_OK;
+    }
+
+    return njs_xml_list_retire(vm, current, name);
 }
 
 
@@ -1230,14 +1344,17 @@ static njs_int_t
 njs_xml_node_tags_handler(njs_vm_t *vm, njs_value_t *value, njs_str_t *name,
     njs_value_t *setval, njs_value_t *retval)
 {
-    size_t       size;
-    int64_t      i, length;
-    xmlNode      *current, *node, *rnode, *copy;
-    njs_int_t    ret;
-    njs_value_t  *push;
+    size_t              size;
+    xmlNode             *current, *first, *last, *node;
+    int64_t             i, length;
+    njs_int_t           ret;
+    njs_value_t         *push;
     njs_opaque_value_t  *start;
 
     current = njs_vm_external(vm, njs_xml_node_proto_id, value);
+
+    first = NULL;
+    last = NULL;
 
     if (retval != NULL && setval == NULL) {
 
@@ -1286,21 +1403,32 @@ njs_xml_node_tags_handler(njs_vm_t *vm, njs_value_t *value, njs_str_t *name,
 
     /* set or delete. */
 
-    copy = xmlDocCopyNode(current, current->doc,
-                          2 /* copy properties and namespaces */);
-    if (njs_slow_path(copy == NULL)) {
-        njs_vm_internal_error(vm, "xmlDocCopyNode() failed");
-        return NJS_ERROR;
-    }
-
     if (retval == NULL) {
         /* delete. */
-        return njs_xml_replace_node(vm, value, copy);
+        if (!njs_xml_node_is_live(current)) {
+            njs_vm_type_error(vm, "XMLNode is detached");
+            return NJS_ERROR;
+        }
+
+        if (current->children == NULL) {
+            return NJS_OK;
+        }
+
+        if (njs_slow_path(njs_xml_list_retire(vm, current, NULL) != NJS_OK)) {
+            return NJS_ERROR;
+        }
+
+        return NJS_OK;
     }
 
     if (!njs_value_is_array(setval)) {
         njs_vm_type_error(vm, "setval is not an array");
         goto error;
+    }
+
+    if (njs_slow_path(!njs_xml_node_is_live(current))) {
+        njs_vm_type_error(vm, "XMLNode is detached");
+        return NJS_ERROR;
     }
 
     start = (njs_opaque_value_t *) njs_vm_array_start(vm, setval);
@@ -1317,33 +1445,51 @@ njs_xml_node_tags_handler(njs_vm_t *vm, njs_value_t *value, njs_str_t *name,
             goto error;
         }
 
+        if (njs_slow_path(njs_xml_tree_has_namespaces(node))) {
+            njs_vm_type_error(vm, "setval[%D] has namespaces", i);
+            goto error;
+        }
+
         node = xmlDocCopyNode(node, current->doc, 1);
         if (njs_slow_path(node == NULL)) {
             njs_vm_internal_error(vm, "xmlDocCopyNode() failed");
             goto error;
         }
 
-        rnode = xmlAddChild(copy, node);
-        if (njs_slow_path(rnode == NULL)) {
-            njs_vm_internal_error(vm, "xmlAddChild() failed");
-            xmlFreeNode(node);
+        node->parent = NULL;
+        node->prev = last;
+        node->next = NULL;
+
+        if (last != NULL) {
+            last->next = node;
+
+        } else {
+            first = node;
+        }
+
+        last = node;
+    }
+
+    if (current->children != NULL) {
+        if (njs_slow_path(njs_xml_list_retire(vm, current, NULL) != NJS_OK)) {
             goto error;
         }
     }
 
-    ret = xmlReconciliateNs(current->doc, copy);
-    if (njs_slow_path(ret == -1)) {
-        njs_vm_internal_error(vm, "xmlReconciliateNs() failed");
-        goto error;
+    current->children = first;
+    current->last = last;
+
+    for (node = first; node != NULL; node = node->next) {
+        node->parent = current;
     }
 
     njs_value_undefined_set(retval);
 
-    return njs_xml_replace_node(vm, value, copy);
+    return NJS_OK;
 
 error:
 
-    xmlFreeNode(copy);
+    xmlFreeNodeList(first);
 
     return NJS_ERROR;
 }
@@ -1352,18 +1498,18 @@ error:
 static xmlNode *
 njs_xml_external_node(njs_vm_t *vm, njs_value_t *value)
 {
-    xmlNode        *current;
-    njs_xml_doc_t  *tree;
+    xmlDoc   *doc;
+    xmlNode  *current;
 
     current = njs_vm_external(vm, njs_xml_node_proto_id, value);
     if (njs_slow_path(current == NULL)) {
-        tree = njs_vm_external(vm, njs_xml_doc_proto_id, value);
-        if (njs_slow_path(tree == NULL)) {
+        doc = njs_vm_external(vm, njs_xml_doc_proto_id, value);
+        if (njs_slow_path(doc == NULL)) {
             njs_vm_type_error(vm, "\"this\" is not a XMLNode object");
             return NULL;
         }
 
-        current = xmlDocGetRootElement(tree->doc);
+        current = xmlDocGetRootElement(doc);
         if (njs_slow_path(current == NULL)) {
             njs_vm_type_error(vm, "\"this\" is not a XMLNode object");
             return NULL;
@@ -1374,160 +1520,180 @@ njs_xml_external_node(njs_vm_t *vm, njs_value_t *value)
 }
 
 
-static njs_int_t
-njs_xml_str_to_c_string(njs_vm_t *vm, njs_str_t *str, u_char *dst,
+static const u_char *
+njs_xml_string_to_c_string(njs_vm_t *vm, njs_str_t *str, u_char *dst,
     size_t size)
 {
     u_char  *p;
 
-    if (njs_slow_path(str->length > size - njs_length("\0"))) {
-        njs_vm_internal_error(vm, "njs_xml_str_to_c_string() very long string, "
-                              "length >= %uz", size - njs_length("\0"));
-        return NJS_ERROR;
+    if (str->length >= size) {
+        dst = njs_mp_alloc(njs_vm_memory_pool(vm), str->length + 1);
+        if (njs_slow_path(dst == NULL)) {
+            njs_vm_memory_error(vm);
+            return NULL;
+        }
     }
 
     p = njs_cpymem(dst, str->start, str->length);
-    *p = '\0';
-
-    return NJS_OK;
-}
-
-
-static const u_char *
-njs_xml_value_to_c_string(njs_vm_t *vm, njs_value_t *value, u_char *dst,
-    size_t size)
-{
-    u_char     *p;
-    njs_str_t  str;
-    njs_int_t  ret;
-
-    ret = njs_vm_value_to_bytes(vm, &str, value);
-    if (njs_slow_path(ret != NJS_OK)) {
-        return NULL;
-    }
-
-    if (njs_fast_path(str.length + njs_length("\0") < size)) {
-        ret = njs_xml_str_to_c_string(vm, &str, dst, size);
-        if (njs_slow_path(ret != NJS_OK)) {
-            return NULL;
-        }
-
-        return dst;
-    }
-
-    dst = njs_mp_alloc(njs_vm_memory_pool(vm), str.length + njs_length("\0"));
-    if (njs_slow_path(dst == NULL)) {
-        njs_vm_memory_error(vm);
-        return NULL;
-    }
-
-    p = njs_cpymem(dst, str.start, str.length);
     *p = '\0';
 
     return dst;
 }
 
 
-static njs_int_t
-njs_xml_encode_special_chars(njs_vm_t *vm, njs_str_t *src, njs_str_t *out)
+static xmlNode *
+njs_xml_ns_args(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
+    njs_str_t *uri, njs_str_t *local)
 {
-    u_char  *p, *dst, *end;
-    size_t   len;
+    xmlNode      *current;
+    njs_value_t  *value;
 
-    len = 0;
-    end = src->start + src->length;
-
-    for (p = src->start; p < end; p++) {
-        if (*p == '<' || *p == '>') {
-            len += njs_length("&lt");
-        }
-
-        if (*p == '&' || *p == '\r') {
-            len += njs_length("&amp");
-        }
-
-        if (*p == '"') {
-            len += njs_length("&quot");
-        }
-
-        len += 1;
+    current = njs_vm_external(vm, njs_xml_node_proto_id,
+                              njs_argument(args, 0));
+    if (njs_slow_path(current == NULL)) {
+        njs_vm_type_error(vm, "\"this\" is not a XMLNode object");
+        return NULL;
     }
 
-    if (njs_fast_path(len == src->length)) {
-        *out = *src;
-        return NJS_OK;
+    value = njs_arg(args, nargs, 1);
+
+    if (njs_value_is_null(value)) {
+        uri->length = 0;
+        uri->start = NULL;
+
+    } else if (njs_value_is_string(value)) {
+        njs_value_string_get(vm, value, uri);
+
+    } else {
+        njs_vm_type_error(vm, "namespace URI is not a string or null");
+        return NULL;
     }
 
-    out->start = njs_mp_alloc(njs_vm_memory_pool(vm), len);
-    if (njs_slow_path(out->start == NULL)) {
-        njs_vm_memory_error(vm);
-        return NJS_ERROR;
+    value = njs_arg(args, nargs, 2);
+
+    if (njs_slow_path(!njs_value_is_string(value))) {
+        njs_vm_type_error(vm, "local name is not a string");
+        return NULL;
     }
 
-    dst = out->start;
+    njs_value_string_get(vm, value, local);
 
-    for (p = src->start; p < end; p++) {
-        if (*p == '<') {
-            *dst++ = '&';
-            *dst++ = 'l';
-            *dst++ = 't';
-            *dst++ = ';';
+    return current;
+}
 
-        } else if (*p == '>') {
-            *dst++ = '&';
-            *dst++ = 'g';
-            *dst++ = 't';
-            *dst++ = ';';
 
-        } else if (*p == '&') {
-            *dst++ = '&';
-            *dst++ = 'a';
-            *dst++ = 'm';
-            *dst++ = 'p';
-            *dst++ = ';';
+/*
+ * An empty or null URI matches only names without a namespace, as in
+ * DOM getAttributeNS().
+ */
 
-        } else if (*p == '"') {
-            *dst++ = '&';
-            *dst++ = 'q';
-            *dst++ = 'u';
-            *dst++ = 'o';
-            *dst++ = 't';
-            *dst++ = ';';
+static njs_bool_t
+njs_xml_ns_match(const xmlChar *name, xmlNs *ns, njs_str_t *uri,
+    njs_str_t *local)
+{
+    if (local->length != njs_strlen(name)
+        || njs_strncmp(local->start, name, local->length) != 0)
+    {
+        return 0;
+    }
 
-        } else if (*p == '\r') {
-            *dst++ = '&';
-            *dst++ = '#';
-            *dst++ = '1';
-            *dst++ = '3';
-            *dst++ = ';';
+    if (ns == NULL || ns->href == NULL) {
+        return uri->length == 0;
+    }
+
+    return uri->length == njs_strlen(ns->href)
+           && njs_strncmp(uri->start, ns->href, uri->length) == 0;
+}
+
+
+static njs_bool_t
+njs_xml_node_is_live(xmlNode *node)
+{
+    xmlNode  *parent;
+
+    if (node == NULL || node->doc == NULL) {
+        return 0;
+    }
+
+    for (parent = node->parent; parent != NULL; parent = parent->parent) {
+        if (parent == (xmlNode *) node->doc) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static xmlNode *
+njs_xml_list_detach(xmlNode *parent, njs_str_t *name)
+{
+    xmlNode  *node, *next, *first, *last, *keep_first, *keep_last;
+
+    if (name == NULL) {
+        first = parent->children;
+        parent->children = NULL;
+        parent->last = NULL;
+
+        for (node = first; node != NULL; node = node->next) {
+            node->parent = NULL;
+        }
+
+        return first;
+    }
+
+    first = NULL;
+    last = NULL;
+    keep_first = NULL;
+    keep_last = NULL;
+
+    for (node = parent->children; node != NULL; node = next) {
+        next = node->next;
+
+        if (node->type == XML_ELEMENT_NODE
+            && name->length == njs_strlen(node->name)
+            && njs_strncmp(name->start, node->name, name->length) == 0)
+        {
+            node->parent = NULL;
+            node->prev = last;
+            node->next = NULL;
+
+            if (last != NULL) {
+                last->next = node;
+
+            } else {
+                first = node;
+            }
+
+            last = node;
 
         } else {
-            *dst++ = *p;
+            node->parent = parent;
+            node->prev = keep_last;
+            node->next = NULL;
+
+            if (keep_last != NULL) {
+                keep_last->next = node;
+
+            } else {
+                keep_first = node;
+            }
+
+            keep_last = node;
         }
     }
 
-    out->length = len;
+    parent->children = keep_first;
+    parent->last = keep_last;
 
-    return NJS_OK;
+    return first;
 }
 
 
 static njs_int_t
-njs_xml_replace_node(njs_vm_t *vm, njs_value_t *value, xmlNode *current)
+njs_xml_list_retire(njs_vm_t *vm, xmlNode *parent, njs_str_t *name)
 {
-    xmlNode          *old;
-    njs_mp_cleanup_t *cln;
-
-    old = njs_vm_external(vm, njs_xml_node_proto_id, value);
-
-    if (current != NULL) {
-        old = xmlReplaceNode(old, current);
-
-    } else {
-        xmlUnlinkNode(old);
-    }
-
-    njs_value_external_set(value, current);
+    njs_mp_cleanup_t  *cln;
 
     cln = njs_mp_cleanup_add(njs_vm_memory_pool(vm), 0);
     if (njs_slow_path(cln == NULL)) {
@@ -1536,28 +1702,81 @@ njs_xml_replace_node(njs_vm_t *vm, njs_value_t *value, xmlNode *current)
     }
 
     cln->handler = njs_xml_node_cleanup;
-    cln->data = old;
+    cln->data = njs_xml_list_detach(parent, name);
 
     return NJS_OK;
 }
 
 
 static void
+njs_xml_list_append(xmlNode *parent, xmlNode *node)
+{
+    node->parent = parent;
+    node->prev = parent->last;
+    node->next = NULL;
+
+    if (parent->last != NULL) {
+        parent->last->next = node;
+
+    } else {
+        parent->children = node;
+    }
+
+    parent->last = node;
+}
+
+
+static njs_bool_t
+njs_xml_tree_has_namespaces(xmlNode *node)
+{
+    xmlAttr  *attr;
+    xmlNode  *child;
+
+    switch (node->type) {
+    case XML_ELEMENT_NODE:
+        break;
+
+    case XML_TEXT_NODE:
+    case XML_CDATA_SECTION_NODE:
+    case XML_PI_NODE:
+    case XML_COMMENT_NODE:
+        return 0;
+
+    default:
+        return 1;
+    }
+
+    if (node->ns != NULL || node->nsDef != NULL) {
+        return 1;
+    }
+
+    for (attr = node->properties; attr != NULL; attr = attr->next) {
+        if (attr->ns != NULL) {
+            return 1;
+        }
+    }
+
+    for (child = node->children; child != NULL; child = child->next) {
+        if (njs_xml_tree_has_namespaces(child)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static void
 njs_xml_node_cleanup(void *data)
 {
-    xmlNode *current = data;
-
-    xmlFreeNode(current);
+    xmlFreeNodeList(data);
 }
 
 
 static void
 njs_xml_doc_cleanup(void *data)
 {
-    njs_xml_doc_t  *current = data;
-
-    xmlFreeDoc(current->doc);
-    xmlFreeParserCtxt(current->ctx);
+    xmlFreeDoc(data);
 }
 
 
@@ -1755,6 +1974,11 @@ njs_xml_ext_canonicalization(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
         return NJS_ERROR;
     }
 
+    if (njs_slow_path(!njs_xml_node_is_live(current))) {
+        njs_vm_type_error(vm, "XMLNode is detached");
+        return NJS_ERROR;
+    }
+
     comments = njs_value_bool(njs_arg(args, nargs, 3));
 
     excluding = njs_arg(args, nargs, 2);
@@ -1764,6 +1988,13 @@ njs_xml_ext_canonicalization(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
         if (njs_slow_path(node == NULL)) {
             njs_vm_type_error(vm, "\"excluding\" argument is not a XMLNode "
                               "object");
+            return NJS_ERROR;
+        }
+
+        if (njs_slow_path(node->doc != current->doc
+                          || !njs_xml_node_is_live(node)))
+        {
+            njs_vm_type_error(vm, "\"excluding\" is not in XMLNode tree");
             return NJS_ERROR;
         }
 
@@ -1935,8 +2166,7 @@ njs_xml_attr_ext_prop_handler(njs_vm_t *vm, njs_object_prop_t *prop,
             continue;
         }
 
-        return njs_vm_value_string_create(vm, retval, node->children->content,
-                                          njs_strlen(node->children->content));
+        return njs_xml_attr_value(vm, node, retval);
     }
 
     njs_value_undefined_set(retval);
@@ -2011,7 +2241,7 @@ njs_xml_nset_cleanup(void *data)
 
 
 static void
-njs_xml_error(njs_vm_t *vm, njs_xml_doc_t *current, const char *fmt, ...)
+njs_xml_error(njs_vm_t *vm, xmlParserCtxt *ctx, const char *fmt, ...)
 {
     u_char          *p, *last;
     va_list         args;
@@ -2024,7 +2254,7 @@ njs_xml_error(njs_vm_t *vm, njs_xml_doc_t *current, const char *fmt, ...)
     p = njs_vsprintf(errstr, last - 1, fmt, args);
     va_end(args);
 
-    err = xmlCtxtGetLastError(current->ctx);
+    err = xmlCtxtGetLastError(ctx);
 
     if (err != NULL) {
         p = njs_sprintf(p, last - 1, " (libxml2: \"%*s\" at %d:%d)",
